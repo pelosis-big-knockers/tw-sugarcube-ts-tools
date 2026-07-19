@@ -1,0 +1,7 @@
+.git/**
+.gitignore
+.vscodeignore
+scripts/**
+*.vsix
+node_modules/**
+!node_modules/tw-sugarcube-ts-plugin/**

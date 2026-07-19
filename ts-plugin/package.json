@@ -1,0 +1,8 @@
+{
+  "name": "tw-sugarcube-ts-plugin",
+  "version": "0.1.0",
+  "private": true,
+  "description": "TypeScript language-service plugin for SugarCube intelligence.",
+  "type": "commonjs",
+  "main": "index.js"
+}
