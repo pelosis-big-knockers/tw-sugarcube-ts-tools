@@ -1,8 +1,8 @@
 {
   "name": "tw-sugarcube-ts-tools",
   "displayName": "Twine SugarCube TypeScript Tools",
-  "description": "Editor intelligence for SugarCube's setup.* members in TypeScript/JavaScript: completion, go-to-definition, and no false 'property does not exist' errors.",
-  "version": "0.1.0",
+  "description": "Editor intelligence for SugarCube's assignment-populated containers (setup, State.variables, State.temporary, settings) in TypeScript/JavaScript: completion, go-to-definition, and no false 'property does not exist' errors.",
+  "version": "0.2.0",
   "publisher": "pelosis-big-knockers",
   "private": true,
   "license": "MIT",

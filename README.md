@@ -1,13 +1,15 @@
 # Twine SugarCube TypeScript Tools
 
-A VS Code extension that gives editor intelligence for SugarCube's `setup.*`
-members in TypeScript/JavaScript story code — completion, go-to-definition, and no
-spurious "property does not exist" errors — for the plain idiom, with nothing to
-wire up per file:
+A VS Code extension that gives editor intelligence for SugarCube's
+assignment-populated containers in TypeScript/JavaScript story code — completion,
+go-to-definition, and no spurious "property does not exist" errors — for the plain
+idiom, with nothing to wire up per file:
 
 ```ts
 setup.playerName = (): string => State.variables.name; // define anywhere
-setup.playerName();  // completes, ctrl+click jumps here, no red squiggle
+setup.playerName();          // completes, ctrl+click jumps here, no red squiggle
+State.variables.hp = 10;     // story variables, temp variables, and settings
+State.variables.hp;          // all get the same treatment
 ```
 
 ## Why an extension (and not just a tsconfig plugin)
@@ -22,20 +24,22 @@ extensions use. This extension is that thin wrapper around the plugin.
 
 ## What it does
 
-The plugin (in `ts-plugin/`) scans your `.ts`/`.js` files for `setup.<name> = …`
-assignments and, for any `setup.<member>`:
+The plugin (in `ts-plugin/`) scans your `.ts`/`.js` files for assignments to
+SugarCube's author-facing containers — `setup`, `State.variables`,
+`State.temporary`, and `settings` — and, for any member of them:
 
-- lists every member as a **completion** after `setup.`,
+- lists every member as a **completion** after `setup.`, `State.variables.`, etc.,
 - resolves **go-to-definition** to the assignment site(s), and
-- **suppresses** the "Property '…' does not exist on type 'SugarCubeSetupObject'"
-  error — so you don't need a permissive index-signature augmentation.
+- **suppresses** the "property does not exist" error.
 
-Engine globals (`State`, `Story`, `$`, `Config`, …) still come from
-[`@types/twine-sugarcube`](https://www.npmjs.com/package/@types/twine-sugarcube);
-load them with `"types": ["twine-sugarcube"]` in your project's `tsconfig.json`.
+Because the errors are suppressed, you need **no permissive index-signature
+`.d.ts`** in your project. Engine globals (`State`, `Story`, `$`, `Config`, …)
+come from [`@types/twine-sugarcube`](https://www.npmjs.com/package/@types/twine-sugarcube);
+load them with just `"types": ["twine-sugarcube"]` in your project's
+`tsconfig.json` (which is what `tw-server init` writes).
 
 Only `.ts`/`.js` files are covered. Intelligence inside `.twee` passages
-(`<<run setup.foo()>>`) is planned separately.
+(`<<run setup.foo()>>`, `<<set $hp to 10>>`) is planned separately.
 
 ## Development
 
