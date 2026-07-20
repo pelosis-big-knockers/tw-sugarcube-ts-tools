@@ -1,8 +1,8 @@
 {
   "name": "tw-sugarcube-ts-tools",
   "displayName": "Twine SugarCube TypeScript Tools",
-  "description": "Editor intelligence for SugarCube's assignment-populated containers (setup, State.variables, State.temporary, settings) in TypeScript/JavaScript: completion, go-to-definition, and no false 'property does not exist' errors.",
-  "version": "0.2.0",
+  "description": "Editor intelligence for SugarCube in TypeScript/JavaScript: real types on hover, parameter and return-type checking, completion, and go-to-definition for members of setup, State.variables, State.temporary, and settings.",
+  "version": "0.6.2",
   "publisher": "pelosis-big-knockers",
   "private": true,
   "license": "MIT",
@@ -20,7 +20,9 @@
   ],
   "activationEvents": [
     "onLanguage:typescript",
-    "onLanguage:javascript"
+    "onLanguage:javascript",
+    "workspaceContains:**/*.twee",
+    "workspaceContains:**/*.tw"
   ],
   "main": "./extension.js",
   "contributes": {
@@ -29,14 +31,51 @@
         "name": "tw-sugarcube-ts-plugin",
         "enableForWorkspaceTypeScriptVersions": true
       }
+    ],
+    "configuration": {
+      "title": "Twine SugarCube TypeScript Tools",
+      "properties": {
+        "twSugarcube.passageLinks": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Make `setup`/variable members in passages ctrl+clickable by registering them as document links. Only needed as a workaround: Twee 3 Language Tools <= 0.34.0 has a definition provider that never resolves, which blocks native ctrl+click for every extension. VS Code always underlines document links, so leave this off unless you need the gesture."
+        },
+        "twSugarcube.strict": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Type the members of `setup`, `State.variables`, `State.temporary`, and `settings` from their assignments, so wrong arguments, wrong types, and typos are reported. Turn this off to keep those containers permissive (`any`) \u2014 useful if a story assigns members in ways the plugin can't see."
+        },
+        "twSugarcube.passageGoToDefinition": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Bind F12 in passage files to this extension's own go-to-definition, bypassing VS Code's definition aggregation. Only needed as a workaround for the same Twee 3 Language Tools hang. It resolves `setup`/variable members by scanning the workspace, and does NOT know about macros or widgets \u2014 so with a fixed Twee 3 Language Tools, the built-in F12 is strictly better."
+        }
+      }
+    },
+    "commands": [
+      {
+        "command": "twSugarcube.goToDefinition",
+        "title": "Go to Definition (SugarCube passage)",
+        "category": "Twine SugarCube"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "twSugarcube.goToDefinition",
+        "key": "f12",
+        "when": "editorTextFocus && twSugarcube.passageGoToDefinition && resourceExtname =~ /\\.(twee|tw)$/"
+      }
     ]
   },
   "devDependencies": {
-    "@vscode/vsce": "^3.2.0"
+    "@types/twine-sugarcube": "^2.37.2",
+    "@vscode/vsce": "^3.2.0",
+    "typescript": "^5.9.3"
   },
   "scripts": {
     "bundle": "node scripts/bundle-plugin.mjs",
     "postinstall": "node scripts/bundle-plugin.mjs",
-    "package": "npm run bundle && vsce package"
+    "test": "npm run bundle && node test/twee-projection.mjs && node test/passages-transport.mjs && node test/tsserver-smoke.mjs",
+    "package": "npm run bundle && npm test && vsce package"
   }
 }

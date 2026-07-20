@@ -1,0 +1,10 @@
+:: StoryTitle
+Passage Fixture
+
+:: Start
+<<set $hp to 100>>
+You have $hp health.
+<<= setup.playerName()>> attacks for <<= setup.attack(3)>>.
+<<run setup.attack('nope')>>
+<<if $hp gt 0>>Still standing.<</if>>
+<<linkreplace "Custom">>Not JavaScript.<</linkreplace>>

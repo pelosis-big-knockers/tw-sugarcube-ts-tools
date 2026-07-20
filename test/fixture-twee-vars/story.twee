@@ -1,0 +1,8 @@
+:: StoryTitle
+Variables Fixture
+
+:: Start
+<<set $hp to 100>>
+<<set $playerName to "Ada">>
+<<set _scratch to 5>>
+You have $hp health.
