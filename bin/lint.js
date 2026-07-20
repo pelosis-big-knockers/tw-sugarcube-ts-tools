@@ -145,6 +145,14 @@ function main() {
     fail(ts.flattenDiagnosticMessageText(configFile.error.messageText, "\n"));
   }
   const parsed = ts.parseJsonConfigFileContent(configFile.config, ts.sys, projectRoot);
+  // A broken tsconfig (bad `extends`, invalid option) must fail loudly, not
+  // lint against a half-parsed config. TS18003 ("No inputs were found") is
+  // tolerated: a twee-only project has no .ts sources of its own, and the
+  // passage projections are injected as roots below.
+  const configErrors = (parsed.errors || []).filter((e) => e.code !== 18003);
+  if (configErrors.length) {
+    fail(configErrors.map((e) => ts.flattenDiagnosticMessageText(e.messageText, "\n")).join("\n"));
+  }
 
   const projections = collectProjections(projectRoot);
 
@@ -164,11 +172,22 @@ function main() {
   const origGetSource = host.getSourceFile.bind(host);
   host.readFile = (f) => (synthetic.has(norm(f)) ? synthetic.get(norm(f)) : origReadFile(f));
   host.fileExists = (f) => (synthetic.has(norm(f)) ? true : origFileExists(f));
+  // Two programs are built back to back (type recovery, then the real check),
+  // and the default host re-reads and re-parses every file per program. Nothing
+  // on disk changes between the passes, so cache the parsed SourceFiles; only
+  // the augmentation's content differs, and its cache entry is keyed on content
+  // so the second pass re-parses exactly that one file.
+  const sourceCache = new Map(); // normalized path -> { content, sf }
   host.getSourceFile = (fileName, langVersion, onError, shouldCreate) => {
-    if (synthetic.has(norm(fileName))) {
-      return ts.createSourceFile(fileName, synthetic.get(norm(fileName)), langVersion, true);
-    }
-    return origGetSource(fileName, langVersion, onError, shouldCreate);
+    const key = norm(fileName);
+    const content = synthetic.has(key) ? synthetic.get(key) : null;
+    const hit = sourceCache.get(key);
+    if (hit && hit.content === content) return hit.sf;
+    const sf = content !== null
+      ? ts.createSourceFile(fileName, content, langVersion, true)
+      : origGetSource(fileName, langVersion, onError, shouldCreate);
+    if (sf) sourceCache.set(key, { content, sf });
+    return sf;
   };
 
   // Pass 1: a program with an empty augmentation, purely to recover member

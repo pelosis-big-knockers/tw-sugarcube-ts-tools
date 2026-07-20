@@ -26,9 +26,11 @@ async function activate(context) {
     : undefined;
   if (!api) return;
 
-  // Let the passage features push live (unsaved) buffers to the plugin. Both
-  // this send() and the live push go through configurePlugin; the plugin merges
-  // them, and a settings-only send has no liveDoc so it never clears an override.
+  // Let the passage features push live (unsaved) buffers to the plugin. Every
+  // configurePlugin payload — this send() included — carries the full set of
+  // live buffers (liveDocs): VS Code replays only the LAST payload after a
+  // tsserver restart, so any payload missing them would wipe the plugin's
+  // overrides for every open buffer on restart.
   passages.setLiveApi(api);
 
   const send = () => {
@@ -36,6 +38,7 @@ async function activate(context) {
     api.configurePlugin(PLUGIN_ID, {
       strict: config.get("strict", true),
       typoDetection: config.get("typoDetection", false),
+      liveDocs: passages.liveDocsSnapshot(),
     });
   };
 

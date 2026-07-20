@@ -158,6 +158,16 @@ Module._load = originalLoad;
   const plain = twee.project("<<run someLocal(1)>>");
   check("a non-container identifier yields no member",
     memberAtProjection(plain, plain.ts.indexOf("someLocal")) === null, "false positive");
+
+  // Regression: a container-lookalike suffix must not read as the container —
+  // `mysetup.foo` claimed the container `setup` and F12 jumped to an unrelated
+  // `setup.foo` assignment.
+  const lookalike = twee.project("<<run mysetup.attack(3)>>");
+  check("mysetup.attack is not mistaken for setup.attack",
+    memberAtProjection(lookalike, lookalike.ts.indexOf("attack")) === null, "false positive");
+  const stateLookalike = twee.project("<<run GameState.variables.hp>>");
+  check("GameState.variables.hp is not mistaken for State.variables.hp",
+    memberAtProjection(stateLookalike, stateLookalike.ts.indexOf("hp")) === null, "false positive");
 }
 
 // --- 4. the assignment patterns used for go-to-definition ------------------
@@ -221,6 +231,7 @@ Module._load = originalLoad;
   const files = new Map(); // path -> { text, mtime }
   files.set("/w/a.ts", { text: "setup.attack = 1;\nsetup.other = 2;\n", mtime: 1 });
   files.set("/w/b.ts", { text: "line0\nState.variables.hp = 100;\n", mtime: 1 });
+  files.set("/w/c.twee", { text: ":: Start\n<<set $gold to 10>>\n", mtime: 1 });
   const uriFor = (p) => ({ _p: p, fsPath: p, toString: () => "file://" + p });
   let reads = 0;
   stub.workspace.findFiles = async () => [...files.keys()].map(uriFor);
@@ -244,6 +255,18 @@ Module._load = originalLoad;
     hp.length === 1 && hp[0].targetSelectionRange.start.line === 1 &&
       hp[0].targetSelectionRange.start.character === "State.variables.".length, JSON.stringify(hp[0]));
 
+  // A variable created ONLY inside a passage (`<<set $gold to 10>>`) — the
+  // common case for story variables — must be findable too: the twee file is
+  // scanned via its projection and the hit mapped back onto the sigil.
+  const gold = await findAssignments("storyVariables", "gold");
+  check("finds a variable created only by <<set>> in a passage",
+    gold.length === 1 && gold[0].targetUri._p === "/w/c.twee", JSON.stringify(gold));
+  check("...selecting the whole sigil on the right line",
+    !!gold[0] && gold[0].targetSelectionRange.start.line === 1 &&
+      gold[0].targetSelectionRange.start.character === "<<set ".length &&
+      gold[0].targetSelectionRange.end.character === "<<set $gold".length,
+    JSON.stringify(gold[0] && gold[0].targetSelectionRange));
+
   // Cache: an identical follow-up call must not re-read unchanged files.
   const readsBefore = reads;
   await findAssignments("setup", "attack");
@@ -264,6 +287,18 @@ Module._load = originalLoad;
     lineOfOffset(ls, 0) === 0 && lineOfOffset(ls, 2) === 0 && lineOfOffset(ls, 3) === 1 &&
       lineOfOffset(ls, 6) === 1 && lineOfOffset(ls, 7) === 2 && lineOfOffset(ls, 8) === 2,
     "wrong line");
+
+  // tsserver position conversion now works from the same line-starts array.
+  const { toTsPosition, offsetOfTsPosition } = passages.__test;
+  check("toTsPosition converts offsets to 1-based line/offset",
+    JSON.stringify(toTsPosition(ls, 0)) === '{"line":1,"offset":1}' &&
+      JSON.stringify(toTsPosition(ls, 4)) === '{"line":2,"offset":2}' &&
+      JSON.stringify(toTsPosition(ls, 7)) === '{"line":3,"offset":1}',
+    JSON.stringify([toTsPosition(ls, 0), toTsPosition(ls, 4), toTsPosition(ls, 7)]));
+  check("offsetOfTsPosition inverts it (and clamps an out-of-range line)",
+    offsetOfTsPosition(ls, 1, 1) === 0 && offsetOfTsPosition(ls, 2, 2) === 4 &&
+      offsetOfTsPosition(ls, 3, 1) === 7 && offsetOfTsPosition(ls, 99, 1) === 7,
+    "wrong offset");
 }
 
 const failed = results.filter((r) => !r.ok);

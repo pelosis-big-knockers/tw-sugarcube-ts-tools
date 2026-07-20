@@ -133,20 +133,34 @@ let tsApi = null;
 
 function setLiveApi(api) { tsApi = api; }
 
+// The full set of live buffers, as the `liveDocs` payload field. EVERY
+// configurePlugin call carries it (including the settings-only send in
+// extension.js): VS Code replays only the LAST payload after a tsserver
+// restart, so a payload that named just one file would silently drop every
+// other open buffer's override on restart — the plugin would answer from disk
+// for dirty documents while `pushed` still claimed they were current.
+function liveDocsSnapshot() {
+  return Object.fromEntries(pushed);
+}
+
+function sendLiveDocs(reason) {
+  try {
+    tsApi.configurePlugin(PLUGIN_ID, {
+      strict: vscode.workspace.getConfiguration("twSugarcube").get("strict", true),
+      typoDetection: vscode.workspace.getConfiguration("twSugarcube").get("typoDetection", false),
+      liveDocs: liveDocsSnapshot(),
+    });
+  } catch (e) {
+    log(`configurePlugin (${reason}) failed: ${e && e.message}`);
+  }
+}
+
 function pushLiveText(document, text) {
   if (!tsApi || typeof tsApi.configurePlugin !== "function") return;
   const path = tweePath(document);
   if (pushed.get(path) === text) return; // nothing changed since the last push
   pushed.set(path, text);
-  try {
-    tsApi.configurePlugin(PLUGIN_ID, {
-      strict: vscode.workspace.getConfiguration("twSugarcube").get("strict", true),
-      typoDetection: vscode.workspace.getConfiguration("twSugarcube").get("typoDetection", false),
-      liveDoc: { path, text },
-    });
-  } catch (e) {
-    log(`configurePlugin (live push) failed: ${e && e.message}`);
-  }
+  sendLiveDocs("live push");
 }
 
 function clearLiveText(document) {
@@ -154,15 +168,7 @@ function clearLiveText(document) {
   const path = tweePath(document);
   if (!pushed.has(path)) return;
   pushed.delete(path);
-  try {
-    tsApi.configurePlugin(PLUGIN_ID, {
-      strict: vscode.workspace.getConfiguration("twSugarcube").get("strict", true),
-      typoDetection: vscode.workspace.getConfiguration("twSugarcube").get("typoDetection", false),
-      liveDoc: { path, text: null },
-    });
-  } catch (e) {
-    log(`configurePlugin (live clear) failed: ${e && e.message}`);
-  }
+  sendLiveDocs("live clear");
 }
 
 function projectionOf(document) {
@@ -186,16 +192,22 @@ function projectionOf(document) {
 const usable = (document) => !!projectionOf(document).ts.trim();
 
 // tsserver speaks 1-based line/offset; VS Code speaks 0-based line/character.
-function toTsPosition(text, offset) {
-  const before = text.slice(0, offset);
-  return { line: before.split("\n").length, offset: offset - (before.lastIndexOf("\n") + 1) + 1 };
+// Both directions work from a line-starts array (computed once per projection
+// and cached on it) rather than re-splitting/slicing the text per call — the
+// diagnostics refresh converts two spans per diagnostic, which made the old
+// slice-and-split quadratic on a large passage.
+function tsLineStarts(projection) {
+  return projection._lineStarts || (projection._lineStarts = lineStartsOf(projection.ts));
 }
 
-function offsetOfTsPosition(text, line, offset) {
-  const lines = text.split("\n");
-  let total = 0;
-  for (let i = 0; i < line - 1 && i < lines.length; i++) total += lines[i].length + 1;
-  return total + offset - 1;
+function toTsPosition(lineStarts, offset) {
+  const line = lineOfOffset(lineStarts, offset);
+  return { line: line + 1, offset: offset - lineStarts[line] + 1 };
+}
+
+function offsetOfTsPosition(lineStarts, line, offset) {
+  const idx = Math.min(Math.max(line - 1, 0), lineStarts.length - 1);
+  return lineStarts[idx] + offset - 1;
 }
 
 function locate(document, position) {
@@ -208,12 +220,13 @@ function locate(document, position) {
   const projection = projectionOf(document);
   const tsOffset = twee.tweeOffsetToTs(projection.segments, document.offsetAt(position));
   if (tsOffset === null) return null;
-  return { projection, file: projectedPath(document), ...toTsPosition(projection.ts, tsOffset) };
+  return { projection, file: projectedPath(document), ...toTsPosition(tsLineStarts(projection), tsOffset) };
 }
 
 function toTweeRange(document, projection, span) {
-  const start = offsetOfTsPosition(projection.ts, span.start.line, span.start.offset);
-  const end = offsetOfTsPosition(projection.ts, span.end.line, span.end.offset);
+  const lineStarts = tsLineStarts(projection);
+  const start = offsetOfTsPosition(lineStarts, span.start.line, span.start.offset);
+  const end = offsetOfTsPosition(lineStarts, span.end.line, span.end.offset);
   const mapped = twee.tsRangeToTwee(projection.segments, start, Math.max(0, end - start));
   if (!mapped) return null;
   return new vscode.Range(
@@ -246,10 +259,14 @@ function memberAtProjection(projection, tsOffset) {
   if (!name) return null;
   const before = text.slice(Math.max(0, start - 40), start);
   const at = (container) => ({ container, name, tsStart: start, tsEnd: end });
-  if (/setup\s*\.\s*$/.test(before)) return at("setup");
-  if (/State\s*\.\s*variables\s*\.\s*$/.test(before)) return at("storyVariables");
-  if (/State\s*\.\s*temporary\s*\.\s*$/.test(before)) return at("temporary");
-  if (/settings\s*\.\s*$/.test(before)) return at("settings");
+  // The lookbehind matters: without it `mysetup.foo` reads as the container
+  // `setup` and F12 jumps to an unrelated assignment. A wrong jump is the one
+  // failure this provider must not produce (the CONTAINERS regexes carry the
+  // same guard as `(^|[^\w$.])`).
+  if (/(?<![\w$.])setup\s*\.\s*$/.test(before)) return at("setup");
+  if (/(?<![\w$.])State\s*\.\s*variables\s*\.\s*$/.test(before)) return at("storyVariables");
+  if (/(?<![\w$.])State\s*\.\s*temporary\s*\.\s*$/.test(before)) return at("temporary");
+  if (/(?<![\w$.])settings\s*\.\s*$/.test(before)) return at("settings");
   return null;
 }
 
@@ -299,7 +316,8 @@ function* assignmentsIn(text, container) {
 // definition request, and — worst case — once per document link RESOLVE, so a
 // passage with N container references reread the whole workspace N times. Caching
 // by mtime means later calls re-read only files that actually changed.
-const fileCache = new Map(); // uri string -> { mtime, text, lineStarts }
+// Twee files carry their projection too, computed once per (re)read.
+const fileCache = new Map(); // uri string -> { mtime, text, lineStarts, projection? }
 const FILE_CACHE_CAP = 4096; // bound the cache over a long session
 
 async function readCached(uri) {
@@ -317,13 +335,39 @@ async function readCached(uri) {
   } catch (e) { return null; }
   if (fileCache.size >= FILE_CACHE_CAP) fileCache.clear();
   const entry = { mtime: stat.mtime, text, lineStarts: lineStartsOf(text) };
+  if (twee.isTweeFile(uri.fsPath || "")) {
+    try { entry.projection = twee.project(text); } catch (e) { /* skip this file */ }
+  }
   fileCache.set(key, entry);
   return entry;
 }
 
+// Map a member-name span in a projection back to the twee document. In a
+// verbatim segment (`State.variables.hp = 1` written out in a macro) the name
+// maps exactly; in a rewritten one (`$hp` -> `State.variables.hp`) the whole
+// sigil is the selection — there is no narrower author-written span to point at.
+function tweeSpanOfName(segments, nameOffset, nameLength) {
+  for (const s of segments) {
+    if (nameOffset >= s.tsStart && nameOffset <= s.tsStart + s.tsLength) {
+      if (s.tsLength === s.tweeLength) {
+        return { start: s.tweeStart + (nameOffset - s.tsStart), length: nameLength };
+      }
+      return { start: s.tweeStart, length: s.tweeLength };
+    }
+  }
+  return null;
+}
+
+// Sources that can create a container member: TypeScript/JavaScript, and the
+// passages themselves — `<<set $hp to 10>>` is how most story variables come
+// into existence, so twee files are scanned via their projection (where the
+// sigil has already become `State.variables.hp =`) and hits are mapped back
+// onto the author's text.
+const ASSIGNMENT_SOURCES_GLOB = `**/*.{ts,js,mjs,cjs,${twee.TWEE_EXTENSIONS.join(",")}}`;
+
 async function findAssignments(container, name) {
   if (!CONTAINERS[container]) return [];
-  const files = await vscode.workspace.findFiles("**/*.{ts,js,mjs,cjs}", "**/node_modules/**", 2000);
+  const files = await vscode.workspace.findFiles(ASSIGNMENT_SOURCES_GLOB, "**/node_modules/**", 2000);
   log(`  scanning ${files.length} file(s) for ${container}.${name}`);
   // Read (or reuse) files in concurrent batches rather than awaiting one at a
   // time — the sequential await was the bulk of the latency on a large workspace.
@@ -335,28 +379,42 @@ async function findAssignments(container, name) {
     for (const e of got) if (e) read.push(e);
   }
   const locations = [];
-  for (const { uri, text, lineStarts } of read) {
-    for (const { name: found, nameOffset } of assignmentsIn(text, container)) {
-      if (found !== name) continue;
-      const line = lineOfOffset(lineStarts, nameOffset);
-      const lineStart = lineStarts[line];
-      const character = nameOffset - lineStart;
-      const lineEnd = line + 1 < lineStarts.length ? lineStarts[line + 1] - 1 : text.length;
-      const lineText = text.slice(lineStart, lineEnd).replace(/\r$/, "");
-      const selection = new vscode.Range(
+  const locationAt = (uri, text, lineStarts, startOffset, length) => {
+    const line = lineOfOffset(lineStarts, startOffset);
+    const lineStart = lineStarts[line];
+    const character = startOffset - lineStart;
+    const lineEnd = line + 1 < lineStarts.length ? lineStarts[line + 1] - 1 : text.length;
+    const lineText = text.slice(lineStart, lineEnd).replace(/\r$/, "");
+    // Whole-line target range so a peek shows the assignment, with the member
+    // name (or the whole sigil, for a passage) as the selection.
+    return {
+      targetUri: uri,
+      targetRange: new vscode.Range(
+        new vscode.Position(line, 0),
+        new vscode.Position(line, lineText.length)
+      ),
+      targetSelectionRange: new vscode.Range(
         new vscode.Position(line, character),
-        new vscode.Position(line, character + found.length)
-      );
-      // Whole-line target range so a peek shows the assignment, with the member
-      // name itself as the selection.
-      locations.push({
-        targetUri: uri,
-        targetRange: new vscode.Range(
-          new vscode.Position(line, 0),
-          new vscode.Position(line, lineText.length)
-        ),
-        targetSelectionRange: selection,
-      });
+        new vscode.Position(line, character + length)
+      ),
+    };
+  };
+  for (const { uri, text, lineStarts, projection } of read) {
+    if (projection) {
+      // A twee file: search the projection (never the raw text — a literal
+      // `State.variables.x =` inside a macro is projected verbatim, so scanning
+      // both would double-report it), then map each hit back to the source.
+      for (const { name: found, nameOffset } of assignmentsIn(projection.ts, container)) {
+        if (found !== name) continue;
+        const span = tweeSpanOfName(projection.segments, nameOffset, found.length);
+        if (!span) continue;
+        locations.push(locationAt(uri, text, lineStarts, span.start, span.length));
+      }
+    } else {
+      for (const { name: found, nameOffset } of assignmentsIn(text, container)) {
+        if (found !== name) continue;
+        locations.push(locationAt(uri, text, lineStarts, nameOffset, found.length));
+      }
     }
   }
   return locations;
@@ -461,7 +519,8 @@ function register(context) {
         const projection = projectionOf(document);
         const out = [];
         // Every container member reference in the projection.
-        const re = /(setup|State\s*\.\s*variables|State\s*\.\s*temporary|settings)\s*\.\s*([A-Za-z_$][\w$]*)/g;
+        // Lookbehind so `mysetup.foo` doesn't get a link to `setup.foo`.
+        const re = /(?<![\w$.])(setup|State\s*\.\s*variables|State\s*\.\s*temporary|settings)\s*\.\s*([A-Za-z_$][\w$]*)/g;
         let m;
         while ((m = re.exec(projection.ts))) {
           const name = m[2];
@@ -658,10 +717,11 @@ const ALLOWED_COMMANDS = [
 module.exports = {
   register,
   setLiveApi,
+  liveDocsSnapshot,
   ALLOWED_COMMANDS,
   // exposed for tests
   __test: {
-    memberAtProjection, CONTAINERS, assignmentsIn, findAssignments,
+    memberAtProjection, CONTAINERS, assignmentsIn, findAssignments, tweeSpanOfName,
     lineStartsOf, lineOfOffset, toTsPosition, offsetOfTsPosition, tsserverAvailable,
   },
 };

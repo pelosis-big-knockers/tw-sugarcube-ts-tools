@@ -172,7 +172,7 @@ function init(modules) {
     const { dir, tweeFiles, pendingReload } = pstate;
     const force = !!(options && options.force);
     if (!force && Date.now() - pstate.lastScan < RESCAN_INTERVAL_MS) {
-      return { paths: [...tweeFiles.keys()].map((k) => tweeFiles.get(k).virtual), changed: [] };
+      return { paths: [...tweeFiles.values()].map((e) => e.virtual), changed: [] };
     }
     pstate.lastScan = Date.now();
     const paths = [];
@@ -265,6 +265,15 @@ function init(modules) {
     const log = (message) => {
       try { info.project.projectService.logger.info(`[tw-sugarcube] ${message}`); } catch (e) { /* logging is best-effort */ }
     };
+    // The per-project watcher and config handler close over THIS create()'s
+    // info/languageService. tsserver gives plugins no dispose hook, so if the
+    // project is torn down (workspace folder removed, config deleted) those
+    // closures would keep operating on a dead project — each checks this and
+    // deregisters itself instead.
+    const projectClosed = () => {
+      try { return typeof info.project.isClosed === "function" && info.project.isClosed(); }
+      catch (e) { return false; }
+    };
 
     // This project's projections, keyed the way the analyzer expects.
     const scan = (program, checker) => analyzer.scan(program, checker, virtualFile, pstate.tweeFiles);
@@ -288,7 +297,7 @@ function init(modules) {
     if (!hostPatched) {
       hostPatched = true;
       const serverHost = info.serverHost;
-      const served = (p) => states.get(norm(p)) || findTweeEntry(norm(p));
+      const served = (p) => { const key = norm(p); return states.get(key) || findTweeEntry(key); };
       const origRead = serverHost.readFile.bind(serverHost);
       const origExists = serverHost.fileExists.bind(serverHost);
       serverHost.readFile = (p, encoding) => { const s = served(p); return s ? s.content : origRead(p, encoding); };
@@ -509,9 +518,18 @@ function init(modules) {
     // owning project on a keystroke. A project reload re-runs create(), so the
     // previous handler is removed before the new one is added — no duplicates.
     const root = norm(pstate.dir).replace(/\/+$/, "") + "/";
-    const configHandler = (config) => {
-      const live = config && config.liveDoc;
-      if (live && typeof live.path === "string" && norm(live.path).startsWith(root)) {
+    const configHandler = (config, changedLive) => {
+      // A disposed project's handler must not keep driving a dead language
+      // service; deregister on first sight so the Set doesn't accumulate one
+      // handler per closed project over a long session.
+      if (projectClosed()) {
+        configHandlers.delete(configHandler);
+        if (pstate.configHandler === configHandler) pstate.configHandler = null;
+        return;
+      }
+      // changedLive holds the normalized virtual paths whose override was set,
+      // updated, or cleared by this payload (null when the payload had none).
+      if (changedLive && changedLive.some((key) => key.startsWith(root))) {
         pstate.lastScan = 0; // a live edit must bypass the rescan throttle
         syncPassages();
       }
@@ -553,6 +571,16 @@ function init(modules) {
       const knownPaths = () => new Set([...pstate.tweeFiles.keys()]);
       let pending = null;
       const onTweeEvent = () => {
+        // Project torn down since the watcher attached: stop watching and reset
+        // the per-project flags so a future create() for this directory installs
+        // a fresh watcher instead of trusting this dead one.
+        if (projectClosed()) {
+          try { if (pstate.dirWatcher) pstate.dirWatcher.close(); } catch (e) { /* already gone */ }
+          pstate.dirWatcher = null;
+          pstate.watching = false;
+          pstate.dirty = true;
+          return;
+        }
         pstate.lastScan = 0; // a real filesystem event bypasses the throttle
         const before = knownPaths();
         syncTweeVirtuals(pstate, { force: true });
@@ -601,18 +629,30 @@ function init(modules) {
     // tsserver dispatches configurePlugin here, on the module object — once for
     // the whole plugin, not per project.
     onConfigurationChanged(config) {
-      // The live-buffer override is global (keyed by absolute path), so apply it
-      // once here, before any handler runs — each project's handler then re-syncs
-      // only if the pushed file is in its tree. `{ path, text }` sets an override;
-      // `text === null` clears it (document closed) and reverts to disk.
-      const live = config && config.liveDoc;
-      if (live && typeof live.path === "string") {
-        const key = norm(twee.isTweeFile(live.path) ? live.path + ".ts" : live.path);
-        if (live.text === null || live.text === undefined) liveText.delete(key);
-        else liveText.set(key, String(live.text));
+      // The live-buffer overrides are global (keyed by absolute path), so apply
+      // them once here, before any handler runs — each project's handler then
+      // re-syncs only if a changed file is in its tree. `liveDocs` is the FULL
+      // set of live buffers ({ tweePath: text, ... }): present keys set or
+      // update overrides, absent keys clear them (document closed, or state
+      // replayed after a tsserver restart). A payload without the field (an
+      // old-style or settings-only send) leaves the overrides untouched.
+      const docs = config && config.liveDocs;
+      let changedLive = null;
+      if (docs && typeof docs === "object" && !Array.isArray(docs)) {
+        changedLive = [];
+        const next = new Map();
+        for (const p of Object.keys(docs)) {
+          if (typeof docs[p] !== "string") continue;
+          const key = norm(twee.isTweeFile(p) ? p + ".ts" : p);
+          next.set(key, docs[p]);
+          if (liveText.get(key) !== docs[p]) changedLive.push(key);
+        }
+        for (const key of liveText.keys()) if (!next.has(key)) changedLive.push(key);
+        liveText.clear();
+        for (const [k, v] of next) liveText.set(k, v);
       }
       // strict / typoDetection apply to every configured project.
-      for (const handler of configHandlers) handler(config);
+      for (const handler of configHandlers) handler(config, changedLive);
     },
     getExternalFiles(project) {
       const dir = project.getCurrentDirectory();
