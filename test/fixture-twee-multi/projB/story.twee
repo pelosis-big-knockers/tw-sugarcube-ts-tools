@@ -1,0 +1,2 @@
+:: Start
+<<run setup.attackB(99)>>

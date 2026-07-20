@@ -102,9 +102,9 @@ function findTsconfig(ts, dir) {
 
 // Every .twee under the project root, projected to TypeScript.
 function collectProjections(root) {
-  const projections = new Map(); // normalized virtual path -> { content, segments, source, virtual }
+  const projections = new Map(); // normalized virtual path -> { content, segments, source, virtual, text }
   const walk = (d, depth) => {
-    if (depth > 12) return;
+    if (depth > twee.MAX_SCAN_DEPTH) return;
     let entries = [];
     try { entries = fs.readdirSync(d, { withFileTypes: true }); } catch (e) { return; }
     for (const entry of entries) {
@@ -119,8 +119,10 @@ function collectProjections(root) {
         try { projected = twee.project(text); } catch (e) { /* keep empty */ }
         const source = full.replace(/\\/g, "/");
         const virtual = source + ".ts";
+        // Keep the source text: the reporter maps diagnostics back onto it, and
+        // re-reading the file per diagnostic was pure waste.
         projections.set(norm(virtual), {
-          content: projected.ts, segments: projected.segments, source, virtual,
+          content: projected.ts, segments: projected.segments, source, virtual, text,
         });
       }
     }
@@ -190,7 +192,12 @@ function collectFindings(ts, program, projections, augPath) {
   for (const sf of program.getSourceFiles()) {
     if (sf.isDeclarationFile || /[\\/]node_modules[\\/]/.test(sf.fileName)) continue;
     if (norm(sf.fileName) === norm(augPath)) continue; // never surface the generated file
-    const diags = program.getSemanticDiagnostics(sf);
+    // A parse error makes the semantic diagnostics that follow it unreliable
+    // (the type-checker is working from a broken tree), so when a file has
+    // syntax errors report those and skip the semantic cascade for that file.
+    // Without this, a plain syntax error was invisible to the linter entirely.
+    const syntactic = program.getSyntacticDiagnostics(sf);
+    const diags = syntactic.length ? syntactic : program.getSemanticDiagnostics(sf);
     const projection = projections.get(norm(sf.fileName));
     for (const d of diags) {
       if (typeof d.start !== "number") continue;
@@ -201,7 +208,10 @@ function collectFindings(ts, program, projections, augPath) {
         const mapped = twee.tsRangeToTwee(projection.segments, d.start, d.length || 1);
         if (!mapped) continue;
         finding.file = projection.source;
-        Object.assign(finding, offsetToLineCol(readOr(projection.source), mapped.start));
+        // Reuse the text read in collectProjections, with line starts computed
+        // once per file instead of re-slicing the whole file per diagnostic.
+        const lineStarts = projection.lineStarts || (projection.lineStarts = lineStartsOf(projection.text));
+        Object.assign(finding, lineColAt(lineStarts, mapped.start));
       } else {
         finding.file = sf.fileName;
         const lc = sf.getLineAndCharacterOfPosition(d.start);
@@ -215,12 +225,20 @@ function collectFindings(ts, program, projections, augPath) {
   return out;
 }
 
-function readOr(file) {
-  try { return fs.readFileSync(file, "utf8"); } catch (e) { return ""; }
+// Byte offset of each line start, computed once per file; offset -> line/column
+// is then a binary search rather than an O(offset) slice per diagnostic.
+function lineStartsOf(text) {
+  const starts = [0];
+  for (let i = 0; i < text.length; i++) if (text[i] === "\n") starts.push(i + 1);
+  return starts;
 }
-function offsetToLineCol(text, offset) {
-  const before = text.slice(0, offset);
-  return { line: before.split("\n").length, column: offset - (before.lastIndexOf("\n") + 1) + 1 };
+function lineColAt(lineStarts, offset) {
+  let lo = 0, hi = lineStarts.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+    if (lineStarts[mid] <= offset) lo = mid; else hi = mid - 1;
+  }
+  return { line: lo + 1, column: offset - lineStarts[lo] + 1 };
 }
 
 function report(findings, format) {

@@ -253,49 +253,107 @@ function memberAtProjection(projection, tsOffset) {
   return null;
 }
 
-// Offset -> {line, character}, so we never have to open a TextDocument just to
-// convert a position.
-function positionOfOffset(text, offset) {
-  const before = text.slice(0, offset);
-  const line = before.split("\n").length - 1;
-  return { line, character: offset - (before.lastIndexOf("\n") + 1) };
+// Byte offset of each line start, computed once per file. offset->line/char is
+// then a binary search and the line text is a slice, instead of re-splitting or
+// re-slicing the whole file for every match (the old positionOfOffset did a
+// `text.slice(0, offset)` per call and the caller a `text.split("\n")` per hit —
+// quadratic on a large file with many assignments).
+function lineStartsOf(text) {
+  const starts = [0];
+  for (let i = 0; i < text.length; i++) if (text[i] === "\n") starts.push(i + 1);
+  return starts;
+}
+function lineOfOffset(lineStarts, offset) {
+  let lo = 0, hi = lineStarts.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+    if (lineStarts[mid] <= offset) lo = mid; else hi = mid - 1;
+  }
+  return lo;
+}
+
+// Every container-member assignment in `text`, as { name, nameOffset } where
+// nameOffset points at the member NAME itself. Anchoring on the capture group's
+// own span (via the regex `d`/indices flag) matters: searching from the match
+// start with indexOf would find the name inside the container when the name is a
+// substring of it — `setup.up` finds "up" in "setup", `State.variables.aria`
+// finds "aria" in "variables" — and jump into the keyword instead of the member.
+function* assignmentsIn(text, container) {
+  const pattern = CONTAINERS[container];
+  if (!pattern) return;
+  const global = new RegExp(pattern.source, "gd");
+  let match;
+  while ((match = global.exec(text))) {
+    const name = match[2] || match[3];
+    if (!name) continue;
+    // group 2 = dotted member, group 3 = bracketed member; exactly one matches.
+    const span = match.indices && (match.indices[2] || match.indices[3]);
+    // Fallback if indices are unavailable: the member name is the last identifier
+    // token in the match (the container comes first), so lastIndexOf is safe.
+    const nameOffset = span ? span[0] : match.index + match[0].lastIndexOf(name);
+    yield { name, nameOffset };
+  }
+}
+
+// File text cache, invalidated by mtime. findAssignments runs on every F12 and
+// definition request, and — worst case — once per document link RESOLVE, so a
+// passage with N container references reread the whole workspace N times. Caching
+// by mtime means later calls re-read only files that actually changed.
+const fileCache = new Map(); // uri string -> { mtime, text, lineStarts }
+const FILE_CACHE_CAP = 4096; // bound the cache over a long session
+
+async function readCached(uri) {
+  // Read bytes rather than `openTextDocument`: opening a .ts file from inside a
+  // definition request pulls the TypeScript extension into the middle of the
+  // call, and we only need text. stat first so an unchanged file is never reread.
+  let stat;
+  try { stat = await vscode.workspace.fs.stat(uri); } catch (e) { return null; }
+  const key = uri.toString();
+  const hit = fileCache.get(key);
+  if (hit && hit.mtime === stat.mtime) return hit;
+  let text;
+  try {
+    text = Buffer.from(await vscode.workspace.fs.readFile(uri)).toString("utf8");
+  } catch (e) { return null; }
+  if (fileCache.size >= FILE_CACHE_CAP) fileCache.clear();
+  const entry = { mtime: stat.mtime, text, lineStarts: lineStartsOf(text) };
+  fileCache.set(key, entry);
+  return entry;
 }
 
 async function findAssignments(container, name) {
-  const pattern = CONTAINERS[container];
-  if (!pattern) return [];
+  if (!CONTAINERS[container]) return [];
   const files = await vscode.workspace.findFiles("**/*.{ts,js,mjs,cjs}", "**/node_modules/**", 2000);
   log(`  scanning ${files.length} file(s) for ${container}.${name}`);
+  // Read (or reuse) files in concurrent batches rather than awaiting one at a
+  // time — the sequential await was the bulk of the latency on a large workspace.
+  const BATCH = 48;
+  const read = [];
+  for (let i = 0; i < files.length; i += BATCH) {
+    const chunk = files.slice(i, i + BATCH);
+    const got = await Promise.all(chunk.map((uri) => readCached(uri).then((e) => (e ? { uri, ...e } : null))));
+    for (const e of got) if (e) read.push(e);
+  }
   const locations = [];
-  for (const uri of files) {
-    // Read bytes rather than `openTextDocument`: opening a .ts file from inside
-    // a definition request pulls the TypeScript extension into the middle of the
-    // call, and we only need text.
-    let text;
-    try {
-      text = Buffer.from(await vscode.workspace.fs.readFile(uri)).toString("utf8");
-    } catch (e) { continue; }
-    // Re-scan per occurrence so we can anchor on the member name itself.
-    const global = new RegExp(pattern.source, "g");
-    let match;
-    while ((match = global.exec(text))) {
-      const found = match[2] || match[3];
+  for (const { uri, text, lineStarts } of read) {
+    for (const { name: found, nameOffset } of assignmentsIn(text, container)) {
       if (found !== name) continue;
-      const nameOffset = text.indexOf(found, match.index);
-      const from = positionOfOffset(text, nameOffset);
-      const to = positionOfOffset(text, nameOffset + found.length);
+      const line = lineOfOffset(lineStarts, nameOffset);
+      const lineStart = lineStarts[line];
+      const character = nameOffset - lineStart;
+      const lineEnd = line + 1 < lineStarts.length ? lineStarts[line + 1] - 1 : text.length;
+      const lineText = text.slice(lineStart, lineEnd).replace(/\r$/, "");
       const selection = new vscode.Range(
-        new vscode.Position(from.line, from.character),
-        new vscode.Position(to.line, to.character)
+        new vscode.Position(line, character),
+        new vscode.Position(line, character + found.length)
       );
       // Whole-line target range so a peek shows the assignment, with the member
       // name itself as the selection.
-      const lineText = text.split("\n")[from.line] || "";
       locations.push({
         targetUri: uri,
         targetRange: new vscode.Range(
-          new vscode.Position(from.line, 0),
-          new vscode.Position(from.line, lineText.replace(/\r$/, "").length)
+          new vscode.Position(line, 0),
+          new vscode.Position(line, lineText.length)
         ),
         targetSelectionRange: selection,
       });
@@ -396,7 +454,10 @@ function register(context) {
   const links = vscode.languages.registerDocumentLinkProvider(SELECTOR, {
     provideDocumentLinks(document) {
       try {
-        if (!vscode.workspace.getConfiguration("twSugarcube").get("passageLinks", true)) return [];
+        // Default false, matching package.json — this is an opt-in workaround, so
+        // the fallback must not silently turn it on where the contribution's
+        // declared default isn't applied.
+        if (!vscode.workspace.getConfiguration("twSugarcube").get("passageLinks", false)) return [];
         const projection = projectionOf(document);
         const out = [];
         // Every container member reference in the projection.
@@ -488,24 +549,43 @@ function register(context) {
 
   // --- diagnostics ---
   const diagnostics = vscode.languages.createDiagnosticCollection("twSugarcubePassages");
+  // Latest refresh sequence per document. Two refreshes can be in flight at once
+  // (an open and a save, or a debounced edit and a save); the awaited request
+  // means the slower one can resolve last and clobber the newer diagnostics with
+  // a stale answer. Each refresh stamps a sequence and bails if it's been
+  // superseded by the time its response arrives.
+  const refreshSeq = new Map(); // uri -> latest sequence number
 
   async function refresh(document) {
     if (!vscode.languages.match(SELECTOR, document)) return;
+    const key = document.uri.toString();
+    const seq = (refreshSeq.get(key) || 0) + 1;
+    refreshSeq.set(key, seq);
     if (!usable(document)) { diagnostics.delete(document.uri); return; }
     // Push the current buffer, then query — tsserver applies the two in order.
     pushLiveText(document, document.getText());
     const projection = projectionOf(document);
+    // With typo detection off the containers carry an index signature, so a
+    // member reference never legitimately errors as nonexistent; with it on, the
+    // containers are deliberately closed and "does not exist" is exactly how a
+    // real typo surfaces. So the suppression below is only sound in the off case.
+    const typoDetection = vscode.workspace.getConfiguration("twSugarcube").get("typoDetection", false);
     const body = await request("semanticDiagnosticsSync", { file: projectedPath(document) });
+    // A newer refresh for this document started while we awaited; its answer is
+    // fresher, so drop ours rather than overwrite it with a stale one.
+    if (refreshSeq.get(key) !== seq) return;
     if (!Array.isArray(body)) { diagnostics.delete(document.uri); return; }
     const out = [];
     for (const d of body) {
       if (!d.start || !d.end || !d.text) continue;
       // A projection that tsserver hasn't adopted into the configured project
       // resolves `setup` to the empty shipped interface, making every member
-      // look nonexistent. Those reports are always wrong here: the plugin keeps
-      // the containers open with an index signature, so a genuine unknown member
-      // is never an error in the first place.
-      if (/does not exist on type 'SugarCube/.test(d.text)) continue;
+      // look nonexistent. With typo detection off those reports are always wrong
+      // (a genuine unknown member is never an error), so drop them. With it on,
+      // dropping them would swallow the very typos it exists to find — and the
+      // plugin's own diagnostics proxy already suppresses these while generation
+      // is failing, so a truly unadopted projection stays quiet regardless.
+      if (!typoDetection && /does not exist on type 'SugarCube/.test(d.text)) continue;
       const range = toTweeRange(document, projection, d);
       if (!range) continue; // scaffolding we emitted, not the author's text
       out.push(new vscode.Diagnostic(
@@ -540,6 +620,7 @@ function register(context) {
       if (debounced.has(key)) { clearTimeout(debounced.get(key)); debounced.delete(key); }
       clearLiveText(doc); // plugin reverts to disk for this file
       projections.delete(key);
+      refreshSeq.delete(key);
       diagnostics.delete(doc.uri);
     })
   );
@@ -579,5 +660,8 @@ module.exports = {
   setLiveApi,
   ALLOWED_COMMANDS,
   // exposed for tests
-  __test: { memberAtProjection, CONTAINERS, toTsPosition, offsetOfTsPosition, tsserverAvailable },
+  __test: {
+    memberAtProjection, CONTAINERS, assignmentsIn, findAssignments,
+    lineStartsOf, lineOfOffset, toTsPosition, offsetOfTsPosition, tsserverAvailable,
+  },
 };

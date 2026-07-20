@@ -42,7 +42,10 @@ const stub = {
     openTextDocument: async () => ({ getText: () => "", positionAt: () => ({}) }),
   },
   commands: { getCommands: async () => [], executeCommand: async () => undefined },
-  Range: class {}, Position: class {}, Location: class {}, Hover: class {},
+  // Position/Range capture their args so tests can assert on returned ranges.
+  Position: class { constructor(line, character) { this.line = line; this.character = character; } },
+  Range: class { constructor(start, end) { this.start = start; this.end = end; } },
+  Location: class {}, Hover: class {},
   CompletionItem: class { constructor(name) { this.label = name; } },
   MarkdownString: class { appendCodeblock() {} appendMarkdown() {} },
   Diagnostic: class {}, DiagnosticSeverity: { Error: 0, Warning: 1 },
@@ -177,6 +180,90 @@ Module._load = originalLoad;
     hits("setup", "if (setup.attack === 1) {}").length === 0, "matched an ==");
   check("ignores a lookalike on another object",
     hits("setup", "mysetup.attack = 1;").length === 0, "matched mysetup");
+}
+
+// --- 5. the member offset points at the member, not into the container ------
+// Regression: the name offset was found with indexOf from the match start, which
+// lands inside the container when the member name is a substring of it — jumping
+// into the keyword instead of the member (`setup.up` -> the "up" in "setup").
+{
+  const { assignmentsIn } = passages.__test;
+  const only = (container, text) => [...assignmentsIn(text, container)];
+  const nameAt = (text, container) => {
+    const [a] = only(container, text);
+    return a && text.slice(a.nameOffset, a.nameOffset + a.name.length);
+  };
+
+  // "up" is a substring of "setup"; "aria" is a substring of "variables".
+  const up = only("setup", "setup.up = 1;")[0];
+  check("setup.up points at the member 'up', not into 'setup'",
+    !!up && up.name === "up" && "setup.up = 1;".slice(up.nameOffset, up.nameOffset + 2) === "up" &&
+      up.nameOffset === "setup.".length,
+    JSON.stringify(up));
+  check("setup.e points at the trailing member 'e'",
+    nameAt("setup.e = 1;", "setup") === "e");
+  const aria = only("storyVariables", "State.variables.aria = 3;")[0];
+  check("State.variables.aria points at 'aria', not the 'aria' inside 'variables'",
+    !!aria && aria.nameOffset === "State.variables.".length, JSON.stringify(aria));
+  // A bracketed member's offset lands inside the quotes, on the name itself.
+  const br = only("setup", "setup['up'] = 1;")[0];
+  check("bracketed setup['up'] points at the quoted member",
+    !!br && "setup['up'] = 1;".slice(br.nameOffset, br.nameOffset + 2) === "up", JSON.stringify(br));
+}
+
+// --- 6. findAssignments: correct locations, mtime cache, batched reads -------
+// findAssignments runs on every F12/definition and once per link resolve, so it
+// caches file text by mtime and reads concurrently. This drives it against an
+// in-memory fs to check the mapped locations and that unchanged files aren't
+// reread.
+{
+  const { findAssignments } = passages.__test;
+  const files = new Map(); // path -> { text, mtime }
+  files.set("/w/a.ts", { text: "setup.attack = 1;\nsetup.other = 2;\n", mtime: 1 });
+  files.set("/w/b.ts", { text: "line0\nState.variables.hp = 100;\n", mtime: 1 });
+  const uriFor = (p) => ({ _p: p, fsPath: p, toString: () => "file://" + p });
+  let reads = 0;
+  stub.workspace.findFiles = async () => [...files.keys()].map(uriFor);
+  stub.workspace.fs = {
+    stat: async (uri) => { const f = files.get(uri._p); if (!f) throw new Error("ENOENT"); return { mtime: f.mtime }; },
+    readFile: async (uri) => { reads++; const f = files.get(uri._p); if (!f) throw new Error("ENOENT"); return Buffer.from(f.text, "utf8"); },
+  };
+
+  const found = await findAssignments("setup", "attack");
+  check("findAssignments locates exactly the named member",
+    found.length === 1 && found[0].targetUri._p === "/w/a.ts", JSON.stringify(found));
+  check("...selection spans the member name on the right line",
+    !!found[0] && found[0].targetSelectionRange.start.line === 0 &&
+      found[0].targetSelectionRange.start.character === "setup.".length &&
+      found[0].targetSelectionRange.end.character === "setup.".length + "attack".length,
+    JSON.stringify(found[0] && found[0].targetSelectionRange));
+
+  // A story variable on a non-zero line exercises the line-offset math.
+  const hp = await findAssignments("storyVariables", "hp");
+  check("finds a member on a later line at the right column",
+    hp.length === 1 && hp[0].targetSelectionRange.start.line === 1 &&
+      hp[0].targetSelectionRange.start.character === "State.variables.".length, JSON.stringify(hp[0]));
+
+  // Cache: an identical follow-up call must not re-read unchanged files.
+  const readsBefore = reads;
+  await findAssignments("setup", "attack");
+  check("unchanged files are not re-read (mtime cache)", reads === readsBefore,
+    `re-read ${reads - readsBefore} unchanged file(s)`);
+
+  // Bumping one file's mtime re-reads only that file.
+  files.get("/w/a.ts").mtime = 2;
+  const readsBefore2 = reads;
+  await findAssignments("setup", "attack");
+  check("a changed file IS re-read", reads === readsBefore2 + 1, `re-read ${reads - readsBefore2} file(s)`);
+
+  // Pure line-offset helpers.
+  const { lineStartsOf, lineOfOffset } = passages.__test;
+  const ls = lineStartsOf("ab\ncde\nf");
+  check("lineStartsOf marks each line start", JSON.stringify(ls) === "[0,3,7]", JSON.stringify(ls));
+  check("lineOfOffset binary-searches to the right line",
+    lineOfOffset(ls, 0) === 0 && lineOfOffset(ls, 2) === 0 && lineOfOffset(ls, 3) === 1 &&
+      lineOfOffset(ls, 6) === 1 && lineOfOffset(ls, 7) === 2 && lineOfOffset(ls, 8) === 2,
+    "wrong line");
 }
 
 const failed = results.filter((r) => !r.ok);

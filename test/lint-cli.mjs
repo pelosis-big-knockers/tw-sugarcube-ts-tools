@@ -86,6 +86,28 @@ console.log("lint CLI\n");
   check("Object.assign suppresses typo detection for that container", r.code === 0, `exit ${r.code}: ${r.out}`);
 }
 
+// --- members created only by compound assignments are real members ----------
+// `??=`/`||=`/`&&=` and `+=`-style operators create members too; a member that
+// exists only through one of them must not be reported as a typo.
+{
+  const r = lint("fixture-typos-compound", ["--typos"]);
+  check("a member created only via ??= is not a typo", !/'gold' does not exist/.test(r.out), r.out);
+  check("a member created only via += is not a typo", !/'hp' does not exist/.test(r.out), r.out);
+  // The container must still actually close — the real typo alongside them proves it.
+  check("...but a genuine typo alongside compounds is still caught",
+    /Property 'greeet' does not exist/.test(r.out), r.out);
+  check("exit 1 on the compound fixture's real typo", r.code === 1, `exit ${r.code}`);
+}
+
+// --- a syntax error is reported (not just semantic errors) ------------------
+// The linter used to collect only semantic diagnostics, so a plain parse error
+// passed clean. Syntactic diagnostics must surface too.
+{
+  const r = lint("fixture-lint-syntax");
+  check("a syntax error is reported", /TS1109|Expression expected/.test(r.out), r.out);
+  check("exit code is 1 on a syntax error", r.code === 1, `exit ${r.code}`);
+}
+
 // --- machine-readable output ------------------------------------------------
 {
   const r = lint("fixture-lint", ["--json"]);

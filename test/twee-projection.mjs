@@ -78,6 +78,30 @@ eq("dotted prose variable is projected",
   project("Hello $player.name!").ts.trim(), "State.variables.player.name;");
 check("a bare $ is not projected", project("Costs $ 5").ts.trim() === "", "bare $ leaked");
 
+// SugarCube interpolates temporary (`_`) variables in prose too.
+eq("naked _temp in prose is projected",
+  project("Rolled _scratch this turn.").ts.trim(), "State.temporary.scratch;");
+eq("dotted prose temp variable is projected",
+  project("Name is _hero.name.").ts.trim(), "State.temporary.hero.name;");
+// ...but ordinary text with underscores must not be mistaken for a variable.
+check("a mid-word underscore (snake_case) is not projected",
+  project("please call do_thing now").ts.trim() === "", "snake_case leaked");
+check("double-underscore markup (__underline__) is not projected",
+  project("this is __important__ text").ts.trim() === "", "__markup__ leaked");
+check("a bare _ is not projected", project("a _ b").ts.trim() === "", "bare _ leaked");
+
+// --- comments are inert ---
+// A sigil or word operator inside a comment is the author's note, not code, so it
+// must be copied verbatim rather than rewritten.
+eq("a // line comment inside a macro is left verbatim",
+  project("<<run f($hp) // when $hp gt 0 and alive>>").ts.trim(),
+  "f(State.variables.hp) // when $hp gt 0 and alive;");
+eq("a /* block comment */ inside a macro is left verbatim",
+  project("<<set $a to 1 /* not $b or $c */>>").ts.trim(),
+  "State.variables.a = 1 /* not $b or $c */;");
+eq("a >> inside a block comment does not close the macro early",
+  project("<<run f() /* a >> b */ + 1>>").ts.trim(), "f() /* a >> b */ + 1;");
+
 // --- quote-aware macro scanning ---
 eq("a macro containing >> inside a string still closes correctly",
   project(`<<run setup.say("a>>b")>>`).ts.trim(), `setup.say("a>>b");`);

@@ -513,6 +513,77 @@ async function main() {
   });
   check("no language-service crash (permissive)", !permRun.crashed, "Debug Failure seen in responses or log");
 
+  // ---------- two configured projects in one workspace ----------
+  // The passage cache, reload queue, throttle, and directory watcher were once
+  // module globals. With two projects, each one's getExternalFiles forces a scan
+  // of ITS tree, and the shared deletion pass then evicted the OTHER project's
+  // projections as "missing" — so the two projects perpetually invalidated each
+  // other and a passage in whichever project wasn't scanned last went dark. This
+  // exercises both projects at once and re-checks the first after the second has
+  // been active, which is exactly when the old shared cache dropped it.
+  console.log("\ntwo projects in one workspace:");
+  const multiFixture = path.join(testDir, "fixture-twee-multi");
+  const projADir = toPosix(path.join(multiFixture, "projA"));
+  const projBDir = toPosix(path.join(multiFixture, "projB"));
+  const worldA = toPosix(path.join(multiFixture, "projA", "world.ts"));
+  const worldB = toPosix(path.join(multiFixture, "projB", "world.ts"));
+  const passageA = toPosix(path.join(multiFixture, "projA", "story.twee")) + ".ts";
+  const passageB = toPosix(path.join(multiFixture, "projB", "story.twee")) + ".ts";
+  // A passage CREATED in the second project after load. Under the old single
+  // global watcher, only the first project (projA) was ever watched — projA and
+  // projB are siblings, so projA's recursive watcher never covered projB, and a
+  // new passage there was invisible. This is the deterministic regression guard;
+  // the eviction bug self-heals on the next query, but an unwatched project does
+  // not, so a created-after-load passage in projB is what reliably breaks.
+  const createdB = path.join(multiFixture, "projB", "created.twee");
+  const createdBProjected = toPosix(createdB) + ".ts";
+  rmSync(createdB, { force: true }); // ensure absent at load
+  const multiRun = await withServer(multiFixture, async ({ send, wait, diagnostics, lastOf }) => {
+    send("open", { file: worldA, projectRootPath: projADir });
+    send("open", { file: worldB, projectRootPath: projBDir });
+    await wait(3200);
+
+    // Each passage must join its OWN project's tsconfig, not get merged.
+    send("projectInfo", { file: passageA, needFileNameList: false });
+    await wait(800);
+    const ownerA = lastOf("projectInfo")?.body?.configFileName ?? "";
+    send("projectInfo", { file: passageB, needFileNameList: false });
+    await wait(800);
+    const ownerB = lastOf("projectInfo")?.body?.configFileName ?? "";
+    check("each passage joins its own project",
+      /projA[\\/]tsconfig\.json$/i.test(ownerA) && /projB[\\/]tsconfig\.json$/i.test(ownerB),
+      `A=${ownerA} B=${ownerB}`);
+
+    // Both projections live at once: each reports ITS OWN wrong-argument error
+    // (A expects number, B expects string), so the two texts are distinguishable.
+    send("semanticDiagnosticsSync", { file: passageA });
+    await wait(1500);
+    const diagA = diagnostics();
+    check("project A's passage is analyzed",
+      diagA.some((d) => /'string' is not assignable to parameter of type 'number'/.test(d)), diagA.join(" | "));
+
+    send("semanticDiagnosticsSync", { file: passageB });
+    await wait(1500);
+    const diagB = diagnostics();
+    check("project B's passage is analyzed",
+      diagB.some((d) => /'number' is not assignable to parameter of type 'string'/.test(d)), diagB.join(" | "));
+
+    // Create a passage in the SECOND project after load. It needs projB's own
+    // watcher to be noticed and reloaded into projB's roots; with the old single
+    // watcher (bound to projA) it stays invisible. attackB expects a string, so
+    // once analyzed the wrong number argument must surface as an error.
+    writeFileSync(createdB, ":: New\n<<run setup.attackB(7)>>\n");
+    await wait(1800); // watcher debounce (150ms) + project reload
+    send("semanticDiagnosticsSync", { file: createdBProjected });
+    await wait(1500);
+    const diagCreated = diagnostics();
+    check("a passage created in the second project is watched and analyzed",
+      diagCreated.some((d) => /'number' is not assignable to parameter of type 'string'/.test(d)),
+      diagCreated.join(" | ") || "(no diagnostics — projB was never watched)");
+  });
+  rmSync(createdB, { force: true });
+  check("no language-service crash (multi-project)", !multiRun.crashed, "Debug Failure seen");
+
   const failed = results.filter((r) => !r.ok);
   console.log(`\n${results.length - failed.length}/${results.length} checks passed`);
   if (failed.length) {

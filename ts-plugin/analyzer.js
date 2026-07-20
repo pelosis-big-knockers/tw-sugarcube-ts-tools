@@ -43,6 +43,29 @@ function createAnalyzer(ts) {
     ts.TypeFormatFlags.UseFullyQualifiedType |
     ts.TypeFormatFlags.WriteArrowStyleSignature;
 
+  // Assignment operators that establish a member. `=` and the logical-assign
+  // forms (`??=`/`||=`/`&&=`) settle the member to their right-hand side's type,
+  // so they contribute both a definition site and a type.
+  const ASSIGN_TYPED = new Set([
+    ts.SyntaxKind.EqualsToken,
+    ts.SyntaxKind.QuestionQuestionEqualsToken,
+    ts.SyntaxKind.BarBarEqualsToken,
+    ts.SyntaxKind.AmpersandAmpersandEqualsToken,
+  ]);
+  // Arithmetic/bitwise compound assignments (`+=`, `-=`, `&=`, ...) also create
+  // the member — so it must count as existing for typo detection and offer a
+  // definition site — but the right-hand side alone is a misleading type source
+  // (`hp += 5` says nothing about hp's type), so they contribute a site only and
+  // leave typing to a plain or logical assignment elsewhere.
+  const ASSIGN_SITE_ONLY = new Set([
+    ts.SyntaxKind.PlusEqualsToken, ts.SyntaxKind.MinusEqualsToken,
+    ts.SyntaxKind.AsteriskEqualsToken, ts.SyntaxKind.SlashEqualsToken,
+    ts.SyntaxKind.PercentEqualsToken, ts.SyntaxKind.AsteriskAsteriskEqualsToken,
+    ts.SyntaxKind.LessThanLessThanEqualsToken, ts.SyntaxKind.GreaterThanGreaterThanEqualsToken,
+    ts.SyntaxKind.GreaterThanGreaterThanGreaterThanEqualsToken,
+    ts.SyntaxKind.AmpersandEqualsToken, ts.SyntaxKind.BarEqualsToken, ts.SyntaxKind.CaretEqualsToken,
+  ]);
+
   const isIdent = (n, name) => ts.isIdentifier(n) && n.text === name;
   const isDotted = (n, obj, prop) =>
     ts.isPropertyAccessExpression(n) && isIdent(n.expression, obj) && n.name.text === prop;
@@ -108,31 +131,35 @@ function createAnalyzer(ts) {
           const iface = target && interfaceFor(target);
           if (iface) entryFor(iface).dynamic = true;
         }
-        if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
-          const left = node.left;
-          let objExpr = null, name = null, nameNode = null, dynamic = false;
-          if (ts.isPropertyAccessExpression(left)) {
-            objExpr = left.expression; name = left.name.text; nameNode = left.name;
-          } else if (ts.isElementAccessExpression(left)) {
-            objExpr = left.expression;
-            const arg = left.argumentExpression;
-            if (arg && ts.isStringLiteralLike(arg)) { name = arg.text; nameNode = arg; }
-            else dynamic = true;
-          }
-          const iface = objExpr && interfaceFor(objExpr);
-          if (iface) {
-            const entry = entryFor(iface);
-            if (dynamic) entry.dynamic = true;
-            else if (name) {
-              if (!entry.members.has(name)) entry.members.set(name, { sites: [], types: new Set() });
-              const member = entry.members.get(name);
-              const start = nameNode.getStart(sf);
-              const end = nameNode.getEnd();
-              const site = projection
-                ? tweeSite(projection, start, end)
-                : { fileName: sf.fileName, start, end };
-              if (site) member.sites.push(site);
-              if (checker) member.types.add(typeStringOf(checker, node.right));
+        if (ts.isBinaryExpression(node)) {
+          const kind = node.operatorToken.kind;
+          const contributesType = ASSIGN_TYPED.has(kind);
+          if (contributesType || ASSIGN_SITE_ONLY.has(kind)) {
+            const left = node.left;
+            let objExpr = null, name = null, nameNode = null, dynamic = false;
+            if (ts.isPropertyAccessExpression(left)) {
+              objExpr = left.expression; name = left.name.text; nameNode = left.name;
+            } else if (ts.isElementAccessExpression(left)) {
+              objExpr = left.expression;
+              const arg = left.argumentExpression;
+              if (arg && ts.isStringLiteralLike(arg)) { name = arg.text; nameNode = arg; }
+              else dynamic = true;
+            }
+            const iface = objExpr && interfaceFor(objExpr);
+            if (iface) {
+              const entry = entryFor(iface);
+              if (dynamic) entry.dynamic = true;
+              else if (name) {
+                if (!entry.members.has(name)) entry.members.set(name, { sites: [], types: new Set() });
+                const member = entry.members.get(name);
+                const start = nameNode.getStart(sf);
+                const end = nameNode.getEnd();
+                const site = projection
+                  ? tweeSite(projection, start, end)
+                  : { fileName: sf.fileName, start, end };
+                if (site) member.sites.push(site);
+                if (checker && contributesType) member.types.add(typeStringOf(checker, node.right));
+              }
             }
           }
         }

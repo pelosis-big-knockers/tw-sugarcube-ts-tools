@@ -87,6 +87,20 @@ function emitExpression(builder, text, base, opts) {
       continue;
     }
 
+    // Line and block comments: copy verbatim, no rewriting inside, so a `$hp` or
+    // a word operator that happens to sit in a comment isn't turned into code.
+    if (c === "/" && (text[i + 1] === "/" || text[i + 1] === "*")) {
+      let j = i + 2;
+      if (text[i + 1] === "/") {
+        while (j < text.length && text[j] !== "\n") j++;
+      } else {
+        while (j < text.length && !(text[j] === "*" && text[j + 1] === "/")) j++;
+        if (j < text.length) j += 2; // consume the closing */
+      }
+      i = j;
+      continue;
+    }
+
     const prev = i > 0 ? text[i - 1] : "";
     const atTokenStart = !isIdentPart(prev) && prev !== ".";
 
@@ -149,6 +163,15 @@ function findMacros(text) {
         }
         continue;
       }
+      // A `>>` inside a block comment must not close the macro early. (Line
+      // comments are left alone: a `//` runs to end of line, and in the common
+      // single-line macro that would swallow the real closing `>>`.)
+      if (c === "/" && text[j + 1] === "*") {
+        j += 2;
+        while (j < text.length && !(text[j] === "*" && text[j + 1] === "/")) j++;
+        if (j < text.length) j += 2;
+        continue;
+      }
       if (c === ">" && text[j + 1] === ">") { close = j; break; }
       j++;
     }
@@ -173,19 +196,25 @@ function splitMacro(inner, innerBase) {
   return { name: inner.slice(k, e), argStart: innerBase + e, arg: inner.slice(e) };
 }
 
-// Naked `$var` references in passage prose (outside macros) — SugarCube
-// interpolates these, so they deserve hover and completion too.
+// Naked `$story` / `_temporary` references in passage prose (outside macros) —
+// SugarCube interpolates both, so they deserve hover and completion too. The
+// guards keep false positives out of ordinary text: a sigil must be at a token
+// start (not mid-word like `snake_case`), followed by an identifier, and not by
+// its own sigil char — `$$` is an escaped dollar and `__x__` is underline markup,
+// neither a variable. When in doubt it skips: a missing hover is recoverable, a
+// wrong one isn't.
 function emitProseVariables(builder, text, base, from, to) {
   let i = from;
   while (i < to) {
     const c = text[i];
-    if (c !== "$") { i++; continue; }
+    if (c !== "$" && c !== "_") { i++; continue; }
     const prev = i > 0 ? text[i - 1] : "";
     if (isIdentPart(prev) || prev === ".") { i++; continue; }
-    if (i + 1 >= to || !isIdentStart(text[i + 1]) || text[i + 1] === "$") { i++; continue; }
+    const next = text[i + 1];
+    if (i + 1 >= to || !isIdentStart(next) || next === c) { i++; continue; }
     let j = i + 1;
     while (j < to && isIdentPart(text[j])) j++;
-    // Allow `$player.name`
+    // Allow `$player.name` / `_scratch.field`
     while (j < to && text[j] === "." && j + 1 < to && isIdentStart(text[j + 1])) {
       j++;
       while (j < to && isIdentPart(text[j])) j++;
@@ -283,7 +312,13 @@ const isTweeFile = (name) => TWEE_FILE_RE.test(name);
 // A VS Code DocumentSelector glob, e.g. "**/*.{twee,tw,twee2,tw2}".
 const TWEE_GLOB = `**/*.{${TWEE_EXTENSIONS.join(",")}}`;
 
+// How deep the plugin and CLI walk the project tree for .twee files. Defined
+// once here so the two can't disagree: they used to (8 vs 12), which meant a
+// deeply nested passage could lint clean yet be invisible to the editor. Just a
+// runaway/symlink-loop backstop — real projects don't nest passages this deep.
+const MAX_SCAN_DEPTH = 24;
+
 module.exports = {
   project, tsOffsetToTwee, tweeOffsetToTs, tsRangeToTwee,
-  TWEE_EXTENSIONS, TWEE_FILE_RE, isTweeFile, TWEE_GLOB,
+  TWEE_EXTENSIONS, TWEE_FILE_RE, isTweeFile, TWEE_GLOB, MAX_SCAN_DEPTH,
 };
