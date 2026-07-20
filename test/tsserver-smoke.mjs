@@ -9,11 +9,17 @@
 // here before shipping.
 import { spawn } from "child_process";
 import { readFileSync, existsSync, writeFileSync, cpSync, rmSync } from "fs";
+import { createRequire } from "module";
 import path from "path";
 import { fileURLToPath } from "url";
 
 const testDir = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.dirname(testDir);
+const require = createRequire(import.meta.url);
+// Positions inside projected passage files are computed from the REAL
+// projection rather than hardcoded, so a layout change in the projector (e.g.
+// scaffolding moving to its own line) doesn't silently invalidate them.
+const { project: projectTwee } = require(path.join(repoRoot, "ts-plugin", "twee.js"));
 const toPosix = (p) => p.split("\\").join("/");
 const TSSERVER = toPosix(path.join(repoRoot, "node_modules", "typescript", "lib", "tsserver.js"));
 
@@ -223,7 +229,9 @@ async function main() {
 
     // `setup.attack` is defined in world.ts and typed via the augmentation, so
     // hovering it inside a passage must produce the real signature.
-    send("quickinfo", { file: projected, line: 4, offset: 8 });
+    const projTs = projectTwee(readFileSync(path.join(tweeFixture, "story.twee"), "utf8")).ts;
+    const atAttack = positionOf(projTs, "attack(");
+    send("quickinfo", { file: projected, line: atAttack.line, offset: atAttack.offset });
     await wait(900);
     const hover = lastOf("quickinfo")?.body?.displayString ?? "";
     check("passage code resolves setup members",
@@ -239,7 +247,7 @@ async function main() {
     check("valid passage code produces no errors", diags.length === 1, diags.join(" | "));
 
     // Go-to-definition from a passage must land on the author's assignment.
-    send("definitionAndBoundSpan", { file: projected, line: 4, offset: 8 });
+    send("definitionAndBoundSpan", { file: projected, line: atAttack.line, offset: atAttack.offset });
     await wait(900);
     const def = lastOf("definitionAndBoundSpan")?.body?.definitions?.[0];
     check("go-to-definition from a passage lands on the source",
@@ -413,7 +421,9 @@ async function main() {
     // The user's actual gesture: hover the newly added variable inside the
     // passage. The projection grew, so this line did not exist before the edit.
     const projectedTwee = toPosix(editTwee) + ".ts";
-    send("quickinfo", { file: projectedTwee, line: 5, offset: 20 });
+    const editedProj = projectTwee(readFileSync(editTwee, "utf8")).ts;
+    const atEnemy = positionOf(editedProj, "enemyName");
+    send("quickinfo", { file: projectedTwee, line: atEnemy.line, offset: atEnemy.offset });
     await wait(900);
     const inPassage = lastOf("quickinfo")?.body?.displayString ?? "";
     check("hovering the new variable inside the passage works",

@@ -267,7 +267,13 @@ Module._load = originalLoad;
       gold[0].targetSelectionRange.end.character === "<<set $gold".length,
     JSON.stringify(gold[0] && gold[0].targetSelectionRange));
 
+  // findAssignments calls within SWEEP_TTL_MS share one memoized sweep, which
+  // would mask the mtime cache below — reset it so each call stats afresh and
+  // the checks exercise the mtime cache itself.
+  const { memberNamesFor, resetSweep } = passages.__test;
+
   // Cache: an identical follow-up call must not re-read unchanged files.
+  resetSweep();
   const readsBefore = reads;
   await findAssignments("setup", "attack");
   check("unchanged files are not re-read (mtime cache)", reads === readsBefore,
@@ -275,9 +281,26 @@ Module._load = originalLoad;
 
   // Bumping one file's mtime re-reads only that file.
   files.get("/w/a.ts").mtime = 2;
+  resetSweep();
   const readsBefore2 = reads;
   await findAssignments("setup", "attack");
   check("a changed file IS re-read", reads === readsBefore2 + 1, `re-read ${reads - readsBefore2} file(s)`);
+
+  // The memo itself: within the TTL a second sweep does not stat or read.
+  let stats = 0;
+  const origStat = stub.workspace.fs.stat;
+  stub.workspace.fs.stat = async (uri) => { stats++; return origStat(uri); };
+  await findAssignments("storyVariables", "hp"); // rides the memo from the call above
+  check("a sweep within the TTL is served from the memo", stats === 0, `stat called ${stats} time(s)`);
+  stub.workspace.fs.stat = origStat;
+
+  // Bare-sigil completion fallback: every member ever assigned on the
+  // container, from .ts sources and passage projections alike.
+  resetSweep();
+  const names = await memberNamesFor("storyVariables");
+  check("memberNamesFor collects story variables from .ts and passages",
+    names.has("hp") && names.has("gold") && !names.has("attack") && !names.has("other"),
+    JSON.stringify([...names]));
 
   // Pure line-offset helpers.
   const { lineStartsOf, lineOfOffset } = passages.__test;

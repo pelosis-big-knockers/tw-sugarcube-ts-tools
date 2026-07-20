@@ -119,6 +119,17 @@ function collectProjections(root) {
         try { projected = twee.project(text); } catch (e) { /* keep empty */ }
         const source = full.replace(/\\/g, "/");
         const virtual = source + ".ts";
+        // The analyzer's lookup contract keys projections by norm() (which
+        // case-folds), so two twee files differing only in case would silently
+        // collapse to one entry and the other would never be linted — rare, but
+        // say so instead of reporting a clean run.
+        const prior = projections.get(norm(virtual));
+        if (prior && prior.source !== source) {
+          process.stderr.write(
+            `tw-sugarcube-lint: warning: ${source} and ${prior.source} differ only by case; ` +
+            `only one will be linted\n`
+          );
+        }
         // Keep the source text: the reporter maps diagnostics back onto it, and
         // re-reading the file per diagnostic was pure waste.
         projections.set(norm(virtual), {
@@ -177,16 +188,19 @@ function main() {
   // on disk changes between the passes, so cache the parsed SourceFiles; only
   // the augmentation's content differs, and its cache entry is keyed on content
   // so the second pass re-parses exactly that one file.
-  const sourceCache = new Map(); // normalized path -> { content, sf }
+  // Keyed by the EXACT file name, not norm(): norm lowercases, and on a
+  // case-sensitive filesystem two real files differing only in case would
+  // collapse into one cache entry — the second would be served the first's
+  // SourceFile under the wrong name and never actually parsed.
+  const sourceCache = new Map(); // exact path -> { content, sf }
   host.getSourceFile = (fileName, langVersion, onError, shouldCreate) => {
-    const key = norm(fileName);
-    const content = synthetic.has(key) ? synthetic.get(key) : null;
-    const hit = sourceCache.get(key);
+    const content = synthetic.has(norm(fileName)) ? synthetic.get(norm(fileName)) : null;
+    const hit = sourceCache.get(fileName);
     if (hit && hit.content === content) return hit.sf;
     const sf = content !== null
       ? ts.createSourceFile(fileName, content, langVersion, true)
       : origGetSource(fileName, langVersion, onError, shouldCreate);
-    if (sf) sourceCache.set(key, { content, sf });
+    if (sf) sourceCache.set(fileName, { content, sf });
     return sf;
   };
 
@@ -201,7 +215,10 @@ function main() {
 
   const findings = collectFindings(ts, program, projections, augPath);
   report(findings, opts.format);
-  process.exit(findings.length ? 1 : 0);
+  // exitCode, not process.exit(): on Windows a piped stdout drains
+  // asynchronously, and process.exit() truncates whatever hasn't flushed —
+  // a large --json report would come out cut off mid-stream in CI.
+  process.exitCode = findings.length ? 1 : 0;
 }
 
 // Map a diagnostic to a user-facing location, translating passage projections

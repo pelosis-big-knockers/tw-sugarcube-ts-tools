@@ -74,13 +74,37 @@ function emitExpression(builder, text, base, opts) {
   while (i < text.length) {
     const c = text[i];
 
-    // String literals and template literals: copy verbatim, no rewriting inside.
-    if (c === '"' || c === "'" || c === "`") {
+    // String literals: copy verbatim, no rewriting inside.
+    if (c === '"' || c === "'") {
       const quote = c;
       let j = i + 1;
       while (j < text.length) {
         if (text[j] === "\\") { j += 2; continue; }
         if (text[j] === quote) { j++; break; }
+        j++;
+      }
+      i = j;
+      continue;
+    }
+
+    // Template literals: the quoted text is copied verbatim, but `${...}`
+    // substitutions are real expressions — SugarCube resolves sigils inside
+    // them, so `${$hp}` must become `${State.variables.hp}` or the projection
+    // reports "Cannot find name '$hp'" on perfectly good passage code.
+    if (c === "`") {
+      let j = i + 1;
+      while (j < text.length) {
+        if (text[j] === "\\") { j += 2; continue; }
+        if (text[j] === "`") { j++; break; }
+        if (text[j] === "$" && text[j + 1] === "{") {
+          const subStart = j + 2;
+          const subEnd = findSubstitutionEnd(text, subStart);
+          flush(subStart); // everything through the `${` is verbatim
+          emitExpression(builder, text.slice(subStart, subEnd), base + subStart, { allowTo: false });
+          chunkStart = subEnd; // the `}` and the rest rejoin the verbatim run
+          j = subEnd;
+          continue;
+        }
         j++;
       }
       i = j;
@@ -142,6 +166,31 @@ function emitExpression(builder, text, base, opts) {
   flush(text.length);
 }
 
+// The index of the `}` that closes a template-literal substitution opened at
+// `from` (just past the `${`), or text.length if unterminated. Braces inside
+// nested string/template literals don't count toward the depth.
+function findSubstitutionEnd(text, from) {
+  let depth = 1;
+  let k = from;
+  while (k < text.length) {
+    const d = text[k];
+    if (d === '"' || d === "'" || d === "`") {
+      const quote = d;
+      k++;
+      while (k < text.length) {
+        if (text[k] === "\\") { k += 2; continue; }
+        if (text[k] === quote) { k++; break; }
+        k++;
+      }
+      continue;
+    }
+    if (d === "{") depth++;
+    else if (d === "}") { depth--; if (depth === 0) return k; }
+    k++;
+  }
+  return k;
+}
+
 // Find `<<...>>` macros. Quote-aware so `<<print "a>>b">>` closes correctly.
 function findMacros(text) {
   const out = [];
@@ -151,6 +200,7 @@ function findMacros(text) {
     if (open === -1) break;
     let j = open + 2;
     let close = -1;
+    let restart = -1;
     while (j < text.length) {
       const c = text[j];
       if (c === '"' || c === "'" || c === "`") {
@@ -172,10 +222,21 @@ function findMacros(text) {
         if (j < text.length) j += 2;
         continue;
       }
+      // A bare `<<` before any `>>` means the current open wasn't a macro at
+      // all (prose like `damage << armor`) — restart the scan from the real
+      // opener instead of swallowing it into this one's body.
+      if (c === "<" && text[j + 1] === "<") { restart = j; break; }
       if (c === ">" && text[j + 1] === ">") { close = j; break; }
       j++;
     }
-    if (close === -1) break; // unterminated macro; nothing reliable to project
+    if (restart !== -1) { i = restart; continue; }
+    if (close === -1) {
+      // Unterminated scan (a stray `<<` followed by an unpaired quote can run
+      // to end-of-text). Only this span is unreliable — resume right after the
+      // opener so the rest of the document still projects.
+      i = open + 2;
+      continue;
+    }
     out.push({ start: open, end: close + 2, inner: text.slice(open + 2, close) });
     i = close + 2;
   }
@@ -243,19 +304,22 @@ function project(text) {
     if (!parts) continue;
     const { name, arg, argStart } = parts;
 
+    // The scaffolding that closes each emission starts on its own line: the
+    // argument may end in a `//` comment, which would otherwise swallow the
+    // `;` / `) {}` and leave the projection syntactically broken.
     if (EXPRESSION_MACROS.has(name)) {
       if (!arg.trim()) continue;
       emitExpression(builder, arg, argStart, { allowTo: false });
-      builder.raw(";\n");
+      builder.raw("\n;\n");
     } else if (CONDITION_MACROS.has(name)) {
       if (!arg.trim()) continue;
       builder.raw("if (");
       emitExpression(builder, arg, argStart, { allowTo: false });
-      builder.raw(") {}\n");
+      builder.raw("\n) {}\n");
     } else if (name === "set") {
       if (!arg.trim()) continue;
       emitExpression(builder, arg, argStart, { allowTo: true });
-      builder.raw(";\n");
+      builder.raw("\n;\n");
     }
     // Unknown/user-defined macros: their arguments are SugarCube's own
     // argument grammar (bare words, links), not JavaScript. Projecting them
