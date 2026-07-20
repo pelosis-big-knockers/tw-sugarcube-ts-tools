@@ -77,8 +77,12 @@ async function tsserverAvailable() {
 // tsserver is concerned. Measured: with only the .twee open, quickinfo throws
 // No Project; after any .ts file is opened, the identical request succeeds.
 //
-// So open one real TypeScript file in the background. It is never shown; the
-// reference is held so VS Code doesn't discard the document.
+// So open one real TypeScript file in the background. It is never shown.
+// IMPORTANT: VS Code owns TextDocument lifecycle — a document that isn't
+// displayed in an editor can be closed by the editor at any time (holding a JS
+// reference does not prevent it), and closing it lets tsserver release the
+// project. register()'s onDidCloseTextDocument handler clears this so the next
+// request re-warms instead of assuming a project that no longer exists.
 let warmDocument = null;
 async function ensureProjectLoaded() {
   if (warmDocument) return true;
@@ -130,8 +134,16 @@ const projections = new Map(); // document uri -> { text, projection }
 const PLUGIN_ID = "tw-sugarcube-ts-plugin";
 const pushed = new Map(); // twee path -> last text pushed, to skip no-op sends
 let tsApi = null;
+const liveApiReady = () => !!(tsApi && typeof tsApi.configurePlugin === "function");
+// register() parks a callback here so features suppressed while the live
+// channel wasn't up yet (see the dirty-document gates in locate/refresh) can be
+// re-run the moment it is.
+let onLiveApiReady = null;
 
-function setLiveApi(api) { tsApi = api; }
+function setLiveApi(api) {
+  tsApi = api;
+  if (liveApiReady() && onLiveApiReady) onLiveApiReady();
+}
 
 // The full set of live buffers, as the `liveDocs` payload field. EVERY
 // configurePlugin call carries it (including the settings-only send in
@@ -150,25 +162,35 @@ function sendLiveDocs(reason) {
       typoDetection: vscode.workspace.getConfiguration("twSugarcube").get("typoDetection", false),
       liveDocs: liveDocsSnapshot(),
     });
+    return true;
   } catch (e) {
     log(`configurePlugin (${reason}) failed: ${e && e.message}`);
+    return false;
   }
 }
 
 function pushLiveText(document, text) {
-  if (!tsApi || typeof tsApi.configurePlugin !== "function") return;
+  if (!liveApiReady()) return;
   const path = tweePath(document);
-  if (pushed.get(path) === text) return; // nothing changed since the last push
+  const prev = pushed.get(path);
+  if (prev === text) return; // nothing changed since the last push
   pushed.set(path, text);
-  sendLiveDocs("live push");
+  if (!sendLiveDocs("live push")) {
+    // The plugin never saw this text; roll back so the next call retries
+    // instead of skipping as "already pushed".
+    if (prev === undefined) pushed.delete(path); else pushed.set(path, prev);
+  }
 }
 
 function clearLiveText(document) {
-  if (!tsApi || typeof tsApi.configurePlugin !== "function") return;
+  if (!liveApiReady()) return;
   const path = tweePath(document);
   if (!pushed.has(path)) return;
+  const prev = pushed.get(path);
   pushed.delete(path);
-  sendLiveDocs("live clear");
+  // On a failed send the plugin still holds the old override — restore the
+  // record to match, so a later successful send clears it for real.
+  if (!sendLiveDocs("live clear")) pushed.set(path, prev);
 }
 
 function projectionOf(document) {
@@ -212,6 +234,12 @@ function offsetOfTsPosition(lineStarts, line, offset) {
 
 function locate(document, position) {
   if (!usable(document)) return null;
+  // Until the live channel is up (extension.js activates the TypeScript
+  // extension between register() and setLiveApi()), tsserver only sees disk —
+  // mapping its answers through a dirty buffer's projection would misplace
+  // every span. Suppress features on dirty documents for that window, exactly
+  // as before the live channel existed; setLiveApi re-runs the refreshes.
+  if (document.isDirty && !liveApiReady()) return null;
   // Make sure tsserver has this exact buffer before we query it. The debounced
   // change handler usually got here first; this covers a query fired inside the
   // debounce window. tsserver processes requests in order, so the configurePlugin
@@ -365,10 +393,18 @@ function tweeSpanOfName(segments, nameOffset, nameLength) {
 // onto the author's text.
 const ASSIGNMENT_SOURCES_GLOB = `**/*.{ts,js,mjs,cjs,${twee.TWEE_EXTENSIONS.join(",")}}`;
 
-async function findAssignments(container, name) {
-  if (!CONTAINERS[container]) return [];
+// One workspace sweep (findFiles + a stat per file), memoized briefly. A
+// document-link resolve calls findAssignments once per individual link, so a
+// ctrl-hover burst repeated the identical sweep back to back; per-file CONTENT
+// staleness is still governed by readCached's mtime check — only the file list
+// and stat results ride the memo, bounding staleness to SWEEP_TTL_MS.
+const SWEEP_TTL_MS = 2000;
+let sweep = { at: 0, read: null };
+
+async function sweepSources() {
+  if (sweep.read && Date.now() - sweep.at < SWEEP_TTL_MS) return sweep.read;
   const files = await vscode.workspace.findFiles(ASSIGNMENT_SOURCES_GLOB, "**/node_modules/**", 2000);
-  log(`  scanning ${files.length} file(s) for ${container}.${name}`);
+  log(`  sweeping ${files.length} file(s)`);
   // Read (or reuse) files in concurrent batches rather than awaiting one at a
   // time — the sequential await was the bulk of the latency on a large workspace.
   const BATCH = 48;
@@ -378,6 +414,26 @@ async function findAssignments(container, name) {
     const got = await Promise.all(chunk.map((uri) => readCached(uri).then((e) => (e ? { uri, ...e } : null))));
     for (const e of got) if (e) read.push(e);
   }
+  sweep = { at: Date.now(), read };
+  return read;
+}
+
+// Every member name assigned on `container` anywhere in the workspace. This is
+// the completion fallback for a bare sigil, where the projection has nothing
+// for tsserver to complete at yet.
+async function memberNamesFor(container) {
+  const names = new Set();
+  for (const { text, projection } of await sweepSources()) {
+    const haystack = projection ? projection.ts : text;
+    for (const { name } of assignmentsIn(haystack, container)) names.add(name);
+  }
+  return names;
+}
+
+async function findAssignments(container, name) {
+  if (!CONTAINERS[container]) return [];
+  const read = await sweepSources();
+  log(`  scanning ${read.length} file(s) for ${container}.${name}`);
   const locations = [];
   const locationAt = (uri, text, lineStarts, startOffset, length) => {
     const line = lineOfOffset(lineStarts, startOffset);
@@ -450,6 +506,30 @@ function register(context) {
 
   const completion = vscode.languages.registerCompletionItemProvider(SELECTOR, {
     async provideCompletionItems(document, position) {
+      // A bare sigil — `$` or `_` with no identifier after it yet — projects to
+      // NOTHING (prose) or a verbatim `$` (macro), so the tsserver path below
+      // structurally cannot return variable members at the very moment the
+      // trigger characters fire. Serve the workspace's known members directly:
+      // the same regex machinery go-to-definition trusts.
+      const offset = document.offsetAt(position);
+      const text = document.getText();
+      const sigil = text[offset - 1];
+      if (sigil === "$" || sigil === "_") {
+        const before = text[offset - 2];
+        const after = text[offset];
+        // Token start (not `setup.$`, `a$`, or the `$$`/`__` escapes), and
+        // nothing typed after the sigil yet.
+        const atTokenStart = !(before && (/[\w$]/.test(before) || before === "." || before === sigil));
+        const bare = after === undefined || !/[\w$]/.test(after);
+        if (atTokenStart && bare) {
+          const names = await memberNamesFor(sigil === "$" ? "storyVariables" : "temporary");
+          return [...names].map((name) => {
+            const item = new vscode.CompletionItem(name, vscode.CompletionItemKind.Variable);
+            item.sortText = "0" + name;
+            return item;
+          });
+        }
+      }
       const at = locate(document, position);
       if (!at) return null;
       const info = await request("completionInfo", {
@@ -617,6 +697,11 @@ function register(context) {
 
   async function refresh(document) {
     if (!vscode.languages.match(SELECTOR, document)) return;
+    // Same gate as locate(): with the live channel down, tsserver's answer
+    // describes the DISK text, and converting its spans through the dirty
+    // buffer's projection would pin diagnostics to the wrong places — and they
+    // would stick until the next edit. setLiveApi re-runs this refresh.
+    if (document.isDirty && !liveApiReady()) return;
     const key = document.uri.toString();
     const seq = (refreshSeq.get(key) || 0) + 1;
     refreshSeq.set(key, seq);
@@ -676,10 +761,18 @@ function register(context) {
     vscode.workspace.onDidChangeTextDocument((event) => onEdit(event.document)),
     vscode.workspace.onDidCloseTextDocument((doc) => {
       const key = doc.uri.toString();
+      // The warm document's lifecycle belongs to VS Code — it can be closed at
+      // any time, which lets tsserver release the project. Forget it so
+      // ensureProjectLoaded re-warms on the next request instead of returning
+      // true forever against a released project.
+      if (warmDocument && key === warmDocument.uri.toString()) warmDocument = null;
       if (debounced.has(key)) { clearTimeout(debounced.get(key)); debounced.delete(key); }
       clearLiveText(doc); // plugin reverts to disk for this file
       projections.delete(key);
-      refreshSeq.delete(key);
+      // refreshSeq is deliberately KEPT: deleting it on close reset the
+      // counter, so a stale in-flight refresh from before a close could carry
+      // the same seq as a fresh one after a quick reopen and clobber its
+      // diagnostics. The map is bounded by the twee files touched in a session.
       diagnostics.delete(doc.uri);
     })
   );
@@ -695,6 +788,15 @@ function register(context) {
       if (event.affectsConfiguration("twSugarcube.passageGoToDefinition")) applyToggles();
     })
   );
+
+  // register() runs before extension.js has activated the TypeScript extension
+  // and handed us the API, so dirty documents restored by hot exit skip their
+  // first refresh (see the gates in locate/refresh). Re-run them when the live
+  // channel comes up.
+  onLiveApiReady = () => {
+    log("live channel up: refreshing open passage documents");
+    for (const doc of vscode.workspace.textDocuments) refresh(doc);
+  };
 
   log(`registered passage providers for ${JSON.stringify(SELECTOR)}`);
   for (const doc of vscode.workspace.textDocuments) {
@@ -723,5 +825,6 @@ module.exports = {
   __test: {
     memberAtProjection, CONTAINERS, assignmentsIn, findAssignments, tweeSpanOfName,
     lineStartsOf, lineOfOffset, toTsPosition, offsetOfTsPosition, tsserverAvailable,
+    memberNamesFor, resetSweep: () => { sweep = { at: 0, read: null }; },
   },
 };

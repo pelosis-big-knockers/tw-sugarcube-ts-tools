@@ -141,14 +141,25 @@ function init(modules) {
   // methods call this on every keystroke. The timestamp lives per project (on
   // pstate.lastScan); the interval is shared.
   const RESCAN_INTERVAL_MS = 250;
+  // With the directory watcher live, adds/renames/deletes and live-buffer
+  // pushes all flag `dirty` — but an in-place EDIT of a .twee on disk fires no
+  // directory event (watchers deliver name events only; measured against
+  // tsserver's own log), so the walk cannot be skipped outright. It runs at
+  // this relaxed cadence instead: external edits are picked up within ~2s while
+  // steady-state typing does 8x fewer synchronous walks on tsserver's thread.
+  const WATCHED_RESCAN_INTERVAL_MS = 2000;
 
-  // Unsaved editor content, keyed by normalized virtual (.ts) path -> raw twee
-  // text. The plugin runs inside tsserver and cannot see VS Code's dirty
-  // buffers, so the extension pushes the live text through configurePlugin.
-  // While an entry exists it overrides what's on disk, so passage intelligence
-  // reflects the buffer without a save. Cleared when the document closes (back
-  // to disk). Kept module-global — keyed by absolute path, so it is unambiguous
-  // across projects and whichever project owns the file reads it during its scan.
+  // Unsaved editor content, keyed by normalized virtual (.ts) path ->
+  // { virtual, source, text } (original-case paths plus the raw twee text).
+  // The plugin runs inside tsserver and cannot see VS Code's dirty buffers, so
+  // the extension pushes the live text through configurePlugin. While an entry
+  // exists it overrides what's on disk, so passage intelligence reflects the
+  // buffer without a save. Cleared when the document closes (back to disk).
+  // Kept module-global — keyed by absolute path, so it is unambiguous across
+  // projects and whichever project owns the file reads it during its scan. The
+  // original-case paths are kept so an override whose disk file has vanished
+  // (branch switch, atomic-rename save) can still be served — see the
+  // live-preserve pass in syncTweeVirtuals.
   const liveText = new Map();
 
   function projectInto(tweeFiles, key, virtual, source, text, mtime) {
@@ -171,8 +182,15 @@ function init(modules) {
   function syncTweeVirtuals(pstate, options) {
     const { dir, tweeFiles, pendingReload } = pstate;
     const force = !!(options && options.force);
-    if (!force && Date.now() - pstate.lastScan < RESCAN_INTERVAL_MS) {
-      return { paths: [...tweeFiles.values()].map((e) => e.virtual), changed: [] };
+    const cached = () => ({ paths: [...tweeFiles.values()].map((e) => e.virtual), changed: [] });
+    if (!force) {
+      // Item 10, extended to the language-service path: while the directory
+      // watcher is live and nothing has flagged `dirty`, walk at the relaxed
+      // cadence — the watcher catches structural changes and live pushes flag
+      // edits, leaving only external in-place edits for the walk to find.
+      const interval = pstate.watching && !pstate.dirty
+        ? WATCHED_RESCAN_INTERVAL_MS : RESCAN_INTERVAL_MS;
+      if (Date.now() - pstate.lastScan < interval) return cached();
     }
     pstate.lastScan = Date.now();
     const paths = [];
@@ -183,18 +201,18 @@ function init(modules) {
       let mtime = 0;
       try { mtime = fsMod.statSync(file).mtimeMs; } catch (e) { continue; }
       const source = String(file).replace(/\\/g, "/");
-      const cached = tweeFiles.get(key);
+      const entry = tweeFiles.get(key);
       // A live override always wins over disk, and is re-projected whenever its
-      // text changes (tracked by cached.liveText identity) rather than by mtime.
+      // text changes (tracked by entry.liveText identity) rather than by mtime.
       const live = liveText.get(key);
       if (live !== undefined) {
-        if (!cached || cached.liveText !== live) {
+        if (!entry || entry.liveText !== live.text) {
           changed.push(virtual);
           pendingReload.add(virtual);
-          projectInto(tweeFiles, key, virtual, source, live, mtime);
-          tweeFiles.get(key).liveText = live;
+          projectInto(tweeFiles, key, virtual, source, live.text, mtime);
+          tweeFiles.get(key).liveText = live.text;
         }
-      } else if (!cached || cached.mtime !== mtime || cached.liveText !== undefined) {
+      } else if (!entry || entry.mtime !== mtime || entry.liveText !== undefined) {
         // No override (or one was just cleared): (re)project from disk.
         let text = "";
         try { text = fsMod.readFileSync(file, "utf8"); } catch (e) { continue; }
@@ -203,6 +221,24 @@ function init(modules) {
         projectInto(tweeFiles, key, virtual, source, text, mtime);
       }
       paths.push(virtual);
+    }
+    // A live override whose disk file the walk did NOT find (deleted by a
+    // branch switch, or mid-flight in an atomic-rename save) is still an open
+    // editor buffer — the invariant is that live text wins over disk, so keep
+    // serving it rather than letting the eviction pass below kill its
+    // IntelliSense while the document is open.
+    const onDisk = new Set(paths.map(norm));
+    const root = norm(dir).replace(/\/+$/, "") + "/";
+    for (const [key, live] of liveText) {
+      if (onDisk.has(key) || !key.startsWith(root)) continue;
+      const entry = tweeFiles.get(key);
+      if (!entry || entry.liveText !== live.text) {
+        changed.push(live.virtual);
+        pendingReload.add(live.virtual);
+        projectInto(tweeFiles, key, live.virtual, live.source, live.text, 0);
+        tweeFiles.get(key).liveText = live.text;
+      }
+      paths.push(live.virtual);
     }
     // A .twee that was deleted must stop being served. tweeFiles holds only this
     // project's own walk, so "not in paths" means gone from this project — a scan
@@ -215,6 +251,10 @@ function init(modules) {
         tweeFiles.delete(key);
       }
     }
+    // The cache now reflects this walk; only a new watcher event or live push
+    // should force another one. (Meaningless without a watcher — the throttle
+    // governs then — but harmless.)
+    pstate.dirty = false;
     return { paths, changed };
   }
 
@@ -256,8 +296,25 @@ function init(modules) {
   // once members are actually declared from their assignments.
   const readTypos = (config) => !!(config && config.typoDetection === true);
 
+  // Everything here is built for CONFIGURED projects (getExternalFiles roots,
+  // per-directory state, the tsconfig-scoped tree walk). As a global plugin we
+  // are also loaded into inferred projects — and an inferred project rooted at
+  // the same directory as a configured one would SHARE its per-directory state:
+  // the two create() calls evict each other's config handler and regenerate the
+  // same augmentation from different programs in a permanent ping-pong. So
+  // inferred/external projects are left untouched. (Unknown project kinds are
+  // treated as configured, the status quo, rather than silently dropped.)
+  function isConfiguredProject(project) {
+    try {
+      const kinds = ts.server && ts.server.ProjectKind;
+      if (!kinds || project.projectKind === undefined) return true;
+      return project.projectKind === kinds.Configured;
+    } catch (e) { return true; }
+  }
+
   function create(info) {
     const ls = info.languageService;
+    if (!isConfiguredProject(info.project)) return ls;
     const dir = info.project.getCurrentDirectory();
     const virtualFile = virtualFor(dir);
     const state = stateFor(virtualFile);
@@ -525,12 +582,17 @@ function init(modules) {
       if (projectClosed()) {
         configHandlers.delete(configHandler);
         if (pstate.configHandler === configHandler) pstate.configHandler = null;
+        // Drop the dead project's state entirely: its frozen tweeFiles would
+        // otherwise shadow a live project's fresh projection in findTweeEntry
+        // (first hit wins) and be retained for the rest of the session.
+        if (projectStates.get(norm(dir)) === pstate) projectStates.delete(norm(dir));
         return;
       }
       // changedLive holds the normalized virtual paths whose override was set,
       // updated, or cleared by this payload (null when the payload had none).
       if (changedLive && changedLive.some((key) => key.startsWith(root))) {
         pstate.lastScan = 0; // a live edit must bypass the rescan throttle
+        pstate.dirty = true; // ...and the watcher gate — this change isn't on disk
         syncPassages();
       }
 
@@ -579,15 +641,18 @@ function init(modules) {
           pstate.dirWatcher = null;
           pstate.watching = false;
           pstate.dirty = true;
+          // Same as the config handler's close path: a dead project's frozen
+          // projections must not shadow a live project's or leak for the session.
+          if (projectStates.get(norm(dir)) === pstate) projectStates.delete(norm(dir));
           return;
         }
         pstate.lastScan = 0; // a real filesystem event bypasses the throttle
         const before = knownPaths();
+        // The forced walk also clears `dirty`, so a getExternalFiles triggered
+        // by the reload below can trust the cache (item 10) rather than walking
+        // the tree again.
         syncTweeVirtuals(pstate, { force: true });
         const after = knownPaths();
-        // The cache is now current, so a getExternalFiles triggered by the reload
-        // below can trust it (item 10) rather than walking the tree again.
-        pstate.dirty = false;
         const structural = before.size !== after.size ||
           [...after].some((p) => !before.has(p));
         if (structural) {
@@ -601,8 +666,14 @@ function init(modules) {
         syncPassages(); // reload content of whatever now has a ScriptInfo
       };
       const onChange = (changedPath) => {
-        if (!twee.isTweeFile(changedPath) && !/\.(twee|tw|twee2|tw2)\.ts$/i.test(changedPath)) return;
-        // A twee file changed: the next getExternalFiles must re-walk (item 10).
+        // A path with no extension is (almost always) a DIRECTORY event —
+        // renaming or deleting a folder of passages fires only the folder's
+        // path, and filtering it out left every .twee underneath stuck in
+        // pendingReload with no ScriptInfo (the structural reload never ran).
+        const maybeDirectory = !pathMod.extname(changedPath);
+        if (!twee.isTweeFile(changedPath) && !maybeDirectory) return;
+        // A twee file (or a folder that may hold them) changed: the next
+        // getExternalFiles must re-walk (item 10).
         pstate.dirty = true;
         // Debounce: a rename fires delete+create; an editor save can fire twice.
         if (pending) info.serverHost.clearTimeout(pending);
@@ -643,9 +714,13 @@ function init(modules) {
         const next = new Map();
         for (const p of Object.keys(docs)) {
           if (typeof docs[p] !== "string") continue;
-          const key = norm(twee.isTweeFile(p) ? p + ".ts" : p);
-          next.set(key, docs[p]);
-          if (liveText.get(key) !== docs[p]) changedLive.push(key);
+          const source = String(p).replace(/\\/g, "/");
+          const isTwee = twee.isTweeFile(source);
+          const virtual = isTwee ? source + ".ts" : source;
+          const key = norm(virtual);
+          next.set(key, { virtual, source: isTwee ? source : source.replace(/\.ts$/i, ""), text: docs[p] });
+          const prev = liveText.get(key);
+          if (!prev || prev.text !== docs[p]) changedLive.push(key);
         }
         for (const key of liveText.keys()) if (!next.has(key)) changedLive.push(key);
         liveText.clear();
@@ -655,6 +730,7 @@ function init(modules) {
       for (const handler of configHandlers) handler(config, changedLive);
     },
     getExternalFiles(project) {
+      if (!isConfiguredProject(project)) return [];
       const dir = project.getCurrentDirectory();
       const virtualFile = virtualFor(dir);
       stateFor(virtualFile);
@@ -667,7 +743,6 @@ function init(modules) {
       if (ps.watching && !ps.dirty) {
         return [virtualFile].concat([...ps.tweeFiles.values()].map((e) => e.virtual));
       }
-      ps.dirty = false;
       return [virtualFile].concat(syncTweeVirtuals(ps, { force: true }).paths);
     },
   };

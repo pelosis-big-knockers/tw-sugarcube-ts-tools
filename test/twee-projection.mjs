@@ -23,48 +23,53 @@ const eq = (name, actual, expected) =>
 
 console.log("twee projection\n");
 
+// The scaffolding that terminates each emission (`;`, `) {}`) starts on its own
+// line so a trailing `//` comment in the author's code can't swallow it; these
+// helpers compare the projection with that layout noise collapsed.
+const flat = (src) => project(src).ts.trim().replace(/\s+/g, " ");
+
 // --- macro bodies become statements ---
 eq("<<run>> projects its expression",
-  project("<<run setup.attack(3)>>").ts.trim(), "setup.attack(3);");
+  flat("<<run setup.attack(3)>>"), "setup.attack(3) ;");
 eq("<<= >> projects its expression",
-  project("<<= setup.name()>>").ts.trim(), "setup.name();");
+  flat("<<= setup.name()>>"), "setup.name() ;");
 eq("<<print>> projects its expression",
-  project("<<print setup.name()>>").ts.trim(), "setup.name();");
+  flat("<<print setup.name()>>"), "setup.name() ;");
 
 // --- sigils ---
 eq("$var becomes State.variables",
-  project("<<run setup.hit($hp)>>").ts.trim(), "setup.hit(State.variables.hp);");
+  flat("<<run setup.hit($hp)>>"), "setup.hit(State.variables.hp) ;");
 eq("_var becomes State.temporary",
-  project("<<run setup.hit(_scratch)>>").ts.trim(), "setup.hit(State.temporary.scratch);");
+  flat("<<run setup.hit(_scratch)>>"), "setup.hit(State.temporary.scratch) ;");
 eq("<<set $hp to 10>> becomes an assignment",
-  project("<<set $hp to 10>>").ts.trim(), "State.variables.hp = 10;");
+  flat("<<set $hp to 10>>"), "State.variables.hp = 10 ;");
 eq("<<set $hp = 10>> also works",
-  project("<<set $hp = 10>>").ts.trim(), "State.variables.hp = 10;");
+  flat("<<set $hp = 10>>"), "State.variables.hp = 10 ;");
 eq("<<if>> becomes a condition",
-  project("<<if $hp gt 0>>").ts.trim().replace(/\s+/g, " "), "if ( State.variables.hp > 0) {}");
+  flat("<<if $hp gt 0>>"), "if ( State.variables.hp > 0 ) {}");
 
 // SugarCube's word operators are not valid TypeScript; leaving them alone would
 // report a syntax error on a perfectly good passage.
 eq("word operators are translated",
-  project("<<if $hp gte 10 and $gold lt 5>>").ts.trim().replace(/\s+/g, " "),
-  "if ( State.variables.hp >= 10 && State.variables.gold < 5) {}");
+  flat("<<if $hp gte 10 and $gold lt 5>>"),
+  "if ( State.variables.hp >= 10 && State.variables.gold < 5 ) {}");
 eq("'is'/'isnot' translate to strict equality",
-  project("<<if $a is 1 or $b isnot 2>>").ts.trim().replace(/\s+/g, " "),
-  "if ( State.variables.a === 1 || State.variables.b !== 2) {}");
+  flat("<<if $a is 1 or $b isnot 2>>"),
+  "if ( State.variables.a === 1 || State.variables.b !== 2 ) {}");
 eq("a method named like an operator is left alone",
-  project("<<run setup.is(1)>>").ts.trim(), "setup.is(1);");
+  flat("<<run setup.is(1)>>"), "setup.is(1) ;");
 eq("operator words inside strings are left alone",
-  project(`<<run setup.say("this and that")>>`).ts.trim(), `setup.say("this and that");`);
+  flat(`<<run setup.say("this and that")>>`), `setup.say("this and that") ;`);
 
 // --- things that must NOT be rewritten ---
 eq("sigils inside strings are left alone",
-  project(`<<run setup.say("costs $5 to enter")>>`).ts.trim(),
-  `setup.say("costs $5 to enter");`);
+  flat(`<<run setup.say("costs $5 to enter")>>`),
+  `setup.say("costs $5 to enter") ;`);
 eq("'to' inside a string is left alone",
-  project(`<<set $s to "go to town">>`).ts.trim(),
-  `State.variables.s = "go to town";`);
+  flat(`<<set $s to "go to town">>`),
+  `State.variables.s = "go to town" ;`);
 eq("a member named 'to' is not rewritten",
-  project("<<run setup.to()>>").ts.trim(), "setup.to();");
+  flat("<<run setup.to()>>"), "setup.to() ;");
 check("unknown macros are skipped entirely",
   project("<<linkreplace 'Go'>><<mycustom arg>>").ts.trim() === "",
   JSON.stringify(project("<<linkreplace 'Go'>><<mycustom arg>>").ts));
@@ -94,17 +99,67 @@ check("a bare _ is not projected", project("a _ b").ts.trim() === "", "bare _ le
 // A sigil or word operator inside a comment is the author's note, not code, so it
 // must be copied verbatim rather than rewritten.
 eq("a // line comment inside a macro is left verbatim",
-  project("<<run f($hp) // when $hp gt 0 and alive>>").ts.trim(),
-  "f(State.variables.hp) // when $hp gt 0 and alive;");
+  flat("<<run f($hp) // when $hp gt 0 and alive>>"),
+  "f(State.variables.hp) // when $hp gt 0 and alive ;");
 eq("a /* block comment */ inside a macro is left verbatim",
-  project("<<set $a to 1 /* not $b or $c */>>").ts.trim(),
-  "State.variables.a = 1 /* not $b or $c */;");
+  flat("<<set $a to 1 /* not $b or $c */>>"),
+  "State.variables.a = 1 /* not $b or $c */ ;");
 eq("a >> inside a block comment does not close the macro early",
-  project("<<run f() /* a >> b */ + 1>>").ts.trim(), "f() /* a >> b */ + 1;");
+  flat("<<run f() /* a >> b */ + 1>>"), "f() /* a >> b */ + 1 ;");
+
+// The scaffolding newline is what keeps a trailing line comment from swallowing
+// the emitted `;` / `) {}` — the projection must stay VALID TypeScript, checked
+// with the real parser rather than by string shape.
+{
+  const ts = require("typescript");
+  const parsesClean = (src) => {
+    const sf = ts.createSourceFile("p.ts", project(src).ts, ts.ScriptTarget.Latest, true);
+    return (sf.parseDiagnostics || []).length === 0;
+  };
+  check("a trailing // comment in <<if>> still projects to valid TS",
+    parsesClean("<<if $hp gt 0 // sanity check>>"), JSON.stringify(project("<<if $hp gt 0 // sanity check>>").ts));
+  check("a trailing // comment in <<run>> still projects to valid TS",
+    parsesClean("<<run f($hp) // note>>"), JSON.stringify(project("<<run f($hp) // note>>").ts));
+  // ASI hazard: without the newline'd `;`, `$a // note` followed by `($b + 1)`
+  // parsed as a CALL of $a — a bogus "not callable" diagnostic on valid code.
+  const asi = project("<<print $a // note>> <<print ($b + 1)>>").ts;
+  const sf = ts.createSourceFile("p.ts", asi, ts.ScriptTarget.Latest, true);
+  check("a comment before a parenthesized statement does not merge them (ASI)",
+    sf.statements.length === 2 && (sf.parseDiagnostics || []).length === 0,
+    `${sf.statements.length} statement(s) in ${JSON.stringify(asi)}`);
+}
+
+// --- template literals ---
+// SugarCube resolves sigils inside `${...}` substitutions, so they must be
+// rewritten; the quoted text around them must stay untouched.
+eq("a sigil inside a template substitution is rewritten",
+  flat("<<run setup.log(`HP: ${$hp}`)>>"), "setup.log(`HP: ${State.variables.hp}`) ;");
+eq("template text outside the substitution is left alone",
+  flat("<<run setup.log(`costs $5 to enter`)>>"), "setup.log(`costs $5 to enter`) ;");
+check("a nested template's substitution is rewritten too",
+  project("<<run setup.log(`x ${ `y ${$hp}` } z`)>>").ts.includes("${State.variables.hp}"),
+  JSON.stringify(project("<<run setup.log(`x ${ `y ${$hp}` } z`)>>").ts));
+{
+  const src = "<<run setup.log(`HP: ${$hp}`)>>";
+  const { ts: out, segments } = project(src);
+  const back = tsOffsetToTwee(segments, out.indexOf("State.variables.hp"));
+  eq("a substitution sigil maps back onto its $", src[back], "$");
+}
 
 // --- quote-aware macro scanning ---
 eq("a macro containing >> inside a string still closes correctly",
-  project(`<<run setup.say("a>>b")>>`).ts.trim(), `setup.say("a>>b");`);
+  flat(`<<run setup.say("a>>b")>>`), `setup.say("a>>b") ;`);
+eq("a << inside a macro string does not restart the scan",
+  flat(`<<print "a << b">>`), `"a << b" ;`);
+
+// --- prose containing << must not derail macro scanning ---
+// A stray `<<` used to open a bogus macro whose scan could swallow the next
+// real macro (or, via an unpaired quote, run to end-of-text and drop every
+// macro after it).
+eq("a stray << directly before a real macro doesn't swallow it",
+  flat("damage << armor. <<set $hp to 1>>"), "State.variables.hp = 1 ;");
+eq("a stray << plus a later apostrophe doesn't kill the rest of the file",
+  flat("damage << armor, don't panic. <<set $hp to 1>>"), "State.variables.hp = 1 ;");
 
 // --- position mapping ---
 {
@@ -149,9 +204,10 @@ eq("a macro containing >> inside a string still closes correctly",
     "<<= setup.playerName()>> attacks for <<= setup.attack($hp)>>.",
   ].join("\n");
   const { ts, segments } = project(src);
-  const lines = ts.trim().split("\n");
-  // <<set>>, the prose $hp, and the two <<= >> calls.
-  eq("a realistic passage projects every JS site", lines.length, 4);
+  // <<set>>, the prose $hp, and the two <<= >> calls — with each macro's `;`
+  // scaffolding on its own line (prose emissions keep theirs inline).
+  const statements = ts.trim().split("\n").filter((l) => l.trim() && l.trim() !== ";");
+  eq("a realistic passage projects every JS site", statements.length, 4);
   check("title/prose text is not projected as code",
     !/StoryTitle|Spike|health/.test(ts), ts);
   // Every segment must point at real source text of the right shape.
