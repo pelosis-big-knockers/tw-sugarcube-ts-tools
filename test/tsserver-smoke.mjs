@@ -292,8 +292,11 @@ async function main() {
   const liveTweePath = toPosix(path.join(liveFixture, "story.twee"));
   const liveProjected = liveTweePath + ".ts";
   const liveDiskBefore = readFileSync(path.join(liveFixture, "story.twee"), "utf8");
+  // `liveDocs` is the FULL set of live buffers per payload (an absent key
+  // clears that override) — so VS Code's replay of the last payload after a
+  // tsserver restart restores every override, not just the most recent file's.
   const pushLive = (send, text) =>
-    send("configurePlugin", { pluginName: "tw-sugarcube-ts-plugin", configuration: { strict: true, liveDoc: { path: liveTweePath, text } } });
+    send("configurePlugin", { pluginName: "tw-sugarcube-ts-plugin", configuration: { strict: true, liveDocs: text === null ? {} : { [liveTweePath]: text } } });
   const liveRun = await withServer(liveFixture, async ({ proj, send, wait, diagnostics }) => {
     send("open", { file: liveWorld, projectRootPath: proj });
     await wait(2600);
