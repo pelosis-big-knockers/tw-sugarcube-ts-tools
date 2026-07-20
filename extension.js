@@ -26,15 +26,19 @@ async function activate(context) {
     : undefined;
   if (!api) return;
 
-  const send = () =>
+  const send = () => {
+    const config = vscode.workspace.getConfiguration(SECTION);
     api.configurePlugin(PLUGIN_ID, {
-      strict: vscode.workspace.getConfiguration(SECTION).get("strict", true),
+      strict: config.get("strict", true),
+      typoDetection: config.get("typoDetection", false),
     });
+  };
 
   send();
   context.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration((event) => {
-      if (event.affectsConfiguration(`${SECTION}.strict`)) send();
+      if (event.affectsConfiguration(`${SECTION}.strict`) ||
+          event.affectsConfiguration(`${SECTION}.typoDetection`)) send();
     })
   );
 }

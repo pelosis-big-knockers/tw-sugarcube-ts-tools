@@ -1,0 +1,4 @@
+:: Start
+<<set $hp to 100>>
+<<run setup.attack("not a number")>>
+You have $hp HP.

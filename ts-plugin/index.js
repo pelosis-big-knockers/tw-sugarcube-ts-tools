@@ -29,8 +29,6 @@
 function init(modules) {
   const ts = modules.typescript;
 
-  const FORMAT = ts.TypeFormatFlags.NoTruncation | ts.TypeFormatFlags.UseFullyQualifiedType | ts.TypeFormatFlags.WriteArrowStyleSignature;
-  const MAX_TYPE_LENGTH = 400;
   const PROPERTY_MISSING = new Set([2339, 2551, 2552]);
   const ALL_INTERFACES = ["SugarCubeSetupObject", "SugarCubeStoryVariables", "SugarCubeTemporaryVariables", "SugarCubeSettingVariables"];
 
@@ -60,6 +58,11 @@ function init(modules) {
   const fsMod = require("fs");
   const pathMod = require("path");
   const twee = require("./twee.js");
+  // Shared with bin/lint.js so the CLI and the editor cannot drift apart.
+  // It takes `ts` as a parameter because the plugin must use the TypeScript
+  // instance tsserver injected, not one it resolves itself.
+  const { createAnalyzer } = require("./analyzer.js");
+  const analyzer = createAnalyzer(ts);
   const tweeFiles = new Map(); // normalized virtual path -> { content, mtime }
 
   const tweeVirtualFor = (tweePath) => String(tweePath).replace(/\\/g, "/") + ".ts";
@@ -140,133 +143,11 @@ function init(modules) {
     return { paths, changed };
   }
 
-  const isIdent = (n, name) => ts.isIdentifier(n) && n.text === name;
-  const isDotted = (n, obj, prop) => ts.isPropertyAccessExpression(n) && isIdent(n.expression, obj) && n.name.text === prop;
-
-  function interfaceFor(objExpr) {
-    if (isIdent(objExpr, "setup")) return "SugarCubeSetupObject";
-    if (isIdent(objExpr, "settings")) return "SugarCubeSettingVariables";
-    if (isDotted(objExpr, "State", "variables")) return "SugarCubeStoryVariables";
-    if (isDotted(objExpr, "State", "temporary")) return "SugarCubeTemporaryVariables";
-    return null;
-  }
-
-  // Module-scoped types serialize as `import("...").X`, which wouldn't resolve
-  // inside the generated file; fall back to `any` rather than emit something
-  // broken. Same for pathological types.
-  function typeStringOf(checker, expr) {
-    let type = checker.getWidenedType(checker.getTypeAtLocation(expr));
-    type = checker.getBaseTypeOfLiteralType(type);
-    const text = checker.typeToString(type, expr, FORMAT);
-    if (!text || /\bimport\(/.test(text) || text.length > MAX_TYPE_LENGTH || /[\r\n]/.test(text)) return "any";
-    return text;
-  }
-
-  // Translate an assignment site inside a passage projection back to the .twee
-  // document it came from. A sigil assignment (`$hp` -> `State.variables.hp`)
-  // maps onto the `$hp` the author wrote. Returns null when the span has no
-  // counterpart in the source — scaffolding we emitted, never author text.
-  function tweeSite(projection, start, end) {
-    const mapped = twee.tsRangeToTwee(projection.segments, start, end - start);
-    if (!mapped) return null;
-    return {
-      fileName: projection.source,
-      start: mapped.start,
-      end: mapped.start + mapped.length,
-    };
-  }
-
-  // One walk collecting assignment sites (for go-to-definition) and, when a
-  // checker is supplied, member types (for generation).
-  function scan(program, checker, skipFile) {
-    const found = new Map();
-    const entryFor = (iface) => {
-      if (!found.has(iface)) found.set(iface, { members: new Map(), dynamic: false });
-      return found.get(iface);
-    };
-    const skip = skipFile ? norm(skipFile) : null;
-
-    for (const sf of program.getSourceFiles()) {
-      if (sf.isDeclarationFile || /[\\/]node_modules[\\/]/.test(sf.fileName)) continue;
-      if (skip && norm(sf.fileName) === skip) continue;
-      // Passage projections ARE harvested: `<<set $hp to 10>>` is how most story
-      // variables come into existence, so it is the main source of their types.
-      // Their assignment sites live in a virtual file the author can't open, so
-      // each one is translated back to a real span in the .twee document below;
-      // a site that can't be translated is dropped rather than offered as a jump
-      // to nowhere.
-      const projection = tweeFiles.get(norm(sf.fileName));
-      const visit = (node) => {
-        if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
-          const left = node.left;
-          let objExpr = null, name = null, nameNode = null, dynamic = false;
-          if (ts.isPropertyAccessExpression(left)) {
-            objExpr = left.expression; name = left.name.text; nameNode = left.name;
-          } else if (ts.isElementAccessExpression(left)) {
-            objExpr = left.expression;
-            const arg = left.argumentExpression;
-            if (arg && ts.isStringLiteralLike(arg)) { name = arg.text; nameNode = arg; }
-            else dynamic = true;
-          }
-          const iface = objExpr && interfaceFor(objExpr);
-          if (iface) {
-            const entry = entryFor(iface);
-            if (dynamic) entry.dynamic = true;
-            else if (name) {
-              if (!entry.members.has(name)) entry.members.set(name, { sites: [], types: new Set() });
-              const member = entry.members.get(name);
-              const start = nameNode.getStart(sf);
-              const end = nameNode.getEnd();
-              const site = projection
-                ? tweeSite(projection, start, end)
-                : { fileName: sf.fileName, start, end };
-              if (site) member.sites.push(site);
-              if (checker) member.types.add(typeStringOf(checker, node.right));
-            }
-          }
-        }
-        ts.forEachChild(node, visit);
-      };
-      visit(sf);
-    }
-    return found;
-  }
-
-  // Quote a member name only when it isn't a plain identifier. TypeScript echoes
-  // the declaration's own spelling back in hover and completion detail, so a
-  // needlessly quoted `"attack"` shows up as `setup["attack"]` even though the
-  // author writes `setup.attack`. Reserved words are fine unquoted here — they're
-  // legal as property names.
-  const IDENTIFIER = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
-  function propertyKey(name) {
-    return IDENTIFIER.test(name) ? name : JSON.stringify(name);
-  }
-
-  function generate(program, skipFile, strict) {
-    const found = scan(program, program.getTypeChecker(), skipFile);
-    // Every container is described, even if nothing was assigned to it here.
-    for (const name of ALL_INTERFACES) if (!found.has(name)) found.set(name, { members: new Map(), dynamic: true });
-
-    let body = 'import "twine-sugarcube";\ndeclare module "twine-sugarcube" {\n';
-    for (const [iface, entry] of found) {
-      body += `  interface ${iface} {\n`;
-      // Permissive mode is a full escape hatch: no recovered types at all, so
-      // nothing this plugin infers can produce an error.
-      if (strict) {
-        for (const [name, member] of entry.members) {
-          body += `    ${propertyKey(name)}: ${[...member.types].join(" | ") || "any"};\n`;
-        }
-      }
-      // Containers always stay open. Members are routinely created outside the
-      // TypeScript we can see — `<<set $hp to 1>>` in a passage, `Setting.addToggle`
-      // for settings, a computed `setup[expr] = ...` — so reading a member we never
-      // saw assigned must not be an error. Declared members still take precedence
-      // over this index signature, so their types are checked as usual.
-      body += "    [key: string]: any;\n";
-      body += "  }\n";
-    }
-    return body + "}\n";
-  }
+  const { interfaceFor } = analyzer;
+  // Passage projections keyed the way the analyzer expects.
+  const scan = (program, checker, skipFile) => analyzer.scan(program, checker, skipFile, tweeFiles);
+  const generate = (program, skipFile, strict, typos) =>
+    analyzer.generate(program, skipFile, strict, typos, tweeFiles);
 
   function memberAt(sourceFile, position) {
     let found = null;
@@ -300,6 +181,9 @@ function init(modules) {
   }
 
   const readStrict = (config) => (!config || typeof config.strict !== "boolean" ? true : config.strict);
+  // Opt-in, and meaningless without strict: closing a container is only safe
+  // once members are actually declared from their assignments.
+  const readTypos = (config) => !!(config && config.typoDetection === true);
 
   function create(info) {
     const ls = info.languageService;
@@ -340,6 +224,7 @@ function init(modules) {
     }
 
     let strict = readStrict(info.config);
+    let typoDetection = readTypos(info.config);
     let lastProgram = null;
     let refreshing = false;
     let generationOk = false;
@@ -400,7 +285,7 @@ function init(modules) {
       refreshing = true;
       try {
         lastProgram = program;
-        const next = generate(program, virtualFile, strict);
+        const next = generate(program, virtualFile, strict, typoDetection);
         if (next !== state.content) {
           state.content = next;
           invalidate();
@@ -488,9 +373,11 @@ function init(modules) {
     };
 
     proxy.onConfigurationChanged = (config) => {
-      const next = readStrict(config);
-      if (next === strict) return;
-      strict = next;
+      const nextStrict = readStrict(config);
+      const nextTypos = readTypos(config);
+      if (nextStrict === strict && nextTypos === typoDetection) return;
+      strict = nextStrict;
+      typoDetection = nextTypos;
       lastProgram = null; // regenerate under the new mode
       refresh();
     };
@@ -501,7 +388,7 @@ function init(modules) {
     // guaranteed to be ours when several plugins are loaded (that was the 0.4.1
     // bug: the watcher never fired and every member stayed unknown).
     refresh();
-    log(`ready (${state.content.length} bytes generated, strict=${strict})`);
+    log(`ready (${state.content.length} bytes generated, strict=${strict}, typoDetection=${typoDetection})`);
 
     return proxy;
   }

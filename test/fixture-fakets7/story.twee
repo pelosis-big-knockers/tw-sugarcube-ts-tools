@@ -1,0 +1,4 @@
+:: Start
+<<set $hp to 100>>
+<<run setup.attack($hp)>>
+You have $hp HP.

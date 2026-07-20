@@ -351,6 +351,79 @@ async function main() {
   );
   check("no language-service crash (passage edits)", !editRun.crashed, "Debug Failure seen");
 
+  // ---------- typo detection ----------
+  // Closing a container is what turns an unknown member into an error, and it is
+  // the exact thing that made 0.4.0 unusable. Most of these checks are therefore
+  // about what must NOT be reported.
+  console.log("\ntypo detection (twSugarcube.typoDetection = true):");
+  const typoFixture = path.join(testDir, "fixture-typos");
+  const typoUse = toPosix(path.join(typoFixture, "use.ts"));
+  const typoLegit = toPosix(path.join(typoFixture, "legit.ts"));
+  const typoDynamic = toPosix(path.join(typoFixture, "dynamic.ts"));
+  const typoRun = await withServer(typoFixture, async ({ proj, send, wait, diagnostics }) => {
+    send("configurePlugin", { pluginName: "tw-sugarcube-ts-plugin", configuration: { strict: true, typoDetection: true } });
+    send("open", { file: typoUse, projectRootPath: proj });
+    send("open", { file: typoLegit, projectRootPath: proj });
+    send("open", { file: typoDynamic, projectRootPath: proj });
+    await wait(3000);
+
+    send("semanticDiagnosticsSync", { file: typoUse });
+    await wait(1600);
+    const typo = diagnostics();
+    check("a real typo is reported",
+      typo.some((d) => /Property 'attck' does not exist/.test(d)), typo.join(" | ") || "(none)");
+    check("...and suggests the intended member",
+      typo.some((d) => /Did you mean 'attack'/.test(d)), typo.join(" | ") || "(no suggestion)");
+
+    // The false-positive classes that made 0.4.0 unusable.
+    send("semanticDiagnosticsSync", { file: typoLegit });
+    await wait(1600);
+    const legit = diagnostics();
+    check("a member assigned in TypeScript is not a typo",
+      !legit.some((d) => /'attack'/.test(d)), legit.join(" | "));
+    check("a variable created by a passage <<set>> is not a typo",
+      !legit.some((d) => /'hp'/.test(d)), legit.join(" | "));
+    check("a settings member is never a typo (Setting API creates them)",
+      !legit.some((d) => /'volume'/.test(d)), legit.join(" | "));
+    check("nothing legitimate is reported at all", legit.length === 0, legit.join(" | "));
+
+    send("semanticDiagnosticsSync", { file: typoDynamic });
+    await wait(1600);
+    const dyn = diagnostics();
+    check("a computed assignment keeps its container open",
+      dyn.length === 0, dyn.join(" | "));
+
+  });
+  check("no language-service crash (typo detection)", !typoRun.crashed, "Debug Failure seen");
+
+  // Object.assign reopens its container for the WHOLE project, not just the file
+  // it appears in — so this needs its own fixture. (Adding it to the one above
+  // correctly killed typo detection there, which is exactly the point.)
+  const assignFixture = path.join(testDir, "fixture-typos-assign");
+  const assignUse = toPosix(path.join(assignFixture, "assign.ts"));
+  const assignRun = await withServer(assignFixture, async ({ proj, send, wait, diagnostics }) => {
+    send("configurePlugin", { pluginName: "tw-sugarcube-ts-plugin", configuration: { strict: true, typoDetection: true } });
+    send("open", { file: assignUse, projectRootPath: proj });
+    await wait(2600);
+    send("semanticDiagnosticsSync", { file: assignUse });
+    await wait(1600);
+    const diags = diagnostics();
+    check("Object.assign keeps its container open project-wide",
+      diags.length === 0, diags.join(" | "));
+  });
+  check("no language-service crash (Object.assign)", !assignRun.crashed, "Debug Failure seen");
+
+  // Default-off: the same fixture must be silent without the setting.
+  const typoOffRun = await withServer(typoFixture, async ({ proj, send, wait, diagnostics }) => {
+    send("open", { file: typoUse, projectRootPath: proj });
+    await wait(2600);
+    send("semanticDiagnosticsSync", { file: typoUse });
+    await wait(1600);
+    const diags = diagnostics();
+    check("typo detection is off by default", diags.length === 0, diags.join(" | "));
+  });
+  check("no language-service crash (typo detection off)", !typoOffRun.crashed, "Debug Failure seen");
+
   // ---------- permissive mode ----------
   console.log("\npermissive mode (twSugarcube.strict = false):");
   const permRun = await withServer(fixture, async ({ proj, send, wait, diagnostics }) => {

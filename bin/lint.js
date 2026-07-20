@@ -1,0 +1,243 @@
+#!/usr/bin/env node
+// Static linter for SugarCube TypeScript projects.
+//
+// Mirrors what the editor extension checks — parameter/return typing on
+// setup/State.variables/State.temporary/settings, and (opt-in) typo detection —
+// but over the WHOLE project at once, for a pre-commit hook or CI. It shares the
+// exact analysis core the plugin uses (ts-plugin/analyzer.js + twee.js), so the
+// two can't drift.
+//
+// It builds a real Program from the project's tsconfig, injects one virtual .ts
+// per .twee (the same projection the editor sees) plus the generated
+// augmentation, type-checks, and maps passage diagnostics back onto .twee spans.
+"use strict";
+
+const fs = require("fs");
+const path = require("path");
+const { createAnalyzer, norm } = require("../ts-plugin/analyzer.js");
+const twee = require("../ts-plugin/twee.js");
+
+function fail(message) {
+  process.stderr.write(`tw-sugarcube-lint: ${message}\n`);
+  process.exit(2); // 2 = the linter itself could not run; 1 = lint findings
+}
+
+// --- arguments --------------------------------------------------------------
+function parseArgs(argv) {
+  const opts = { dir: ".", strict: true, typoDetection: false, format: "pretty" };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--no-strict") opts.strict = false;
+    else if (a === "--typos" || a === "--typo-detection") opts.typoDetection = true;
+    else if (a === "--json") opts.format = "json";
+    else if (a === "--help" || a === "-h") opts.help = true;
+    else if (a.startsWith("-")) fail(`unknown option ${a}`);
+    else opts.dir = a;
+  }
+  return opts;
+}
+
+const HELP = `Usage: tw-sugarcube-lint [dir] [options]
+
+Type-checks a SugarCube TypeScript project — .ts/.js sources and the code
+embedded in .twee passages — the same way the editor extension does.
+
+Options:
+  --typos, --typo-detection   Report members never assigned anywhere (e.g.
+                              setup.attck). Requires strict. Off by default,
+                              because members created dynamically or in files
+                              outside the project would be reported as typos.
+  --no-strict                 Don't type recovered members; only report errors
+                              TypeScript finds without the augmentation.
+  --json                      Machine-readable output.
+  -h, --help                  This message.
+
+Exit codes: 0 clean, 1 lint findings, 2 the linter could not run.`;
+
+// --- locate a usable TypeScript --------------------------------------------
+// We need the JavaScript compiler API (createProgram + the type-checker types).
+// TypeScript split into TWO lines: the 6.x "JS API" line has that API, while the
+// 7.x native compiler ships as a CLI whose programmatic API is absent until 7.1.
+// A story project may well be on 7.x for its build (`tsc`), so preferring the
+// project's install blindly loads a TypeScript that can't be driven in-process.
+//
+// So: use the project's install only if it actually exposes the API; otherwise
+// fall back to ours (a 6.x/5.x line), which analyzes the same code the same way
+// — the augmentation and member checks don't depend on 7-specific behaviour, and
+// the editor already checks with VS Code's own 6.x tsserver regardless.
+function hasProgramApi(ts) {
+  return !!(ts && typeof ts.createProgram === "function" && ts.TypeFormatFlags && ts.DiagnosticCategory);
+}
+
+function loadTypeScript(dir) {
+  let projectVersion = null;
+  try {
+    const resolved = require.resolve("typescript", { paths: [path.resolve(dir)] });
+    const ts = require(resolved);
+    projectVersion = ts.version;
+    if (hasProgramApi(ts)) return { ts, source: `project (${ts.version})` };
+  } catch (e) { /* fall through */ }
+
+  try {
+    const ts = require("typescript");
+    if (hasProgramApi(ts)) {
+      if (projectVersion) {
+        process.stderr.write(
+          `tw-sugarcube-lint: the project's TypeScript ${projectVersion} has no in-process ` +
+          `compiler API (native 7.x); analyzing with bundled ${ts.version} instead.\n`
+        );
+      }
+      return { ts, source: `bundled (${ts.version})` };
+    }
+  } catch (e) { /* fall through */ }
+
+  fail("could not find a TypeScript with the JavaScript compiler API (need a 6.x/5.x line)");
+}
+
+function findTsconfig(ts, dir) {
+  const found = ts.findConfigFile(path.resolve(dir), ts.sys.fileExists, "tsconfig.json");
+  if (!found) fail(`no tsconfig.json found at or above ${path.resolve(dir)}`);
+  return found;
+}
+
+// Every .twee under the project root, projected to TypeScript.
+function collectProjections(root) {
+  const projections = new Map(); // normalized virtual path -> { content, segments, source, virtual }
+  const walk = (d, depth) => {
+    if (depth > 12) return;
+    let entries = [];
+    try { entries = fs.readdirSync(d, { withFileTypes: true }); } catch (e) { return; }
+    for (const entry of entries) {
+      const full = path.join(d, entry.name);
+      if (entry.isDirectory()) {
+        if (entry.name === "node_modules" || entry.name[0] === ".") continue;
+        walk(full, depth + 1);
+      } else if (/\.(twee|tw)$/i.test(entry.name)) {
+        let text = "";
+        try { text = fs.readFileSync(full, "utf8"); } catch (e) { continue; }
+        let projected = { ts: "", segments: [] };
+        try { projected = twee.project(text); } catch (e) { /* keep empty */ }
+        const source = full.replace(/\\/g, "/");
+        const virtual = source + ".ts";
+        projections.set(norm(virtual), {
+          content: projected.ts, segments: projected.segments, source, virtual,
+        });
+      }
+    }
+  };
+  walk(root, 0);
+  return projections;
+}
+
+function main() {
+  const opts = parseArgs(process.argv.slice(2));
+  if (opts.help) { process.stdout.write(HELP + "\n"); return; }
+
+  const { ts } = loadTypeScript(opts.dir);
+  const analyzer = createAnalyzer(ts);
+  const configPath = findTsconfig(ts, opts.dir);
+  const projectRoot = path.dirname(configPath);
+
+  const configFile = ts.readConfigFile(configPath, ts.sys.readFile);
+  if (configFile.error) {
+    fail(ts.flattenDiagnosticMessageText(configFile.error.messageText, "\n"));
+  }
+  const parsed = ts.parseJsonConfigFileContent(configFile.config, ts.sys, projectRoot);
+
+  const projections = collectProjections(projectRoot);
+
+  // Two synthetic files live only in memory: the augmentation and each passage
+  // projection. The augmentation path sits inside the project so its relative
+  // `import "twine-sugarcube"` resolves against the project's node_modules.
+  const augPath = path.join(projectRoot, "__sugarcube-generated__.d.ts").replace(/\\/g, "/");
+  const synthetic = new Map(); // normalized path -> content
+  for (const proj of projections.values()) synthetic.set(norm(proj.virtual), proj.content);
+  synthetic.set(norm(augPath), ""); // filled after the first pass
+
+  const rootNames = parsed.fileNames.concat([...projections.values()].map((p) => p.virtual), augPath);
+
+  const host = ts.createCompilerHost(parsed.options, true);
+  const origReadFile = host.readFile.bind(host);
+  const origFileExists = host.fileExists.bind(host);
+  const origGetSource = host.getSourceFile.bind(host);
+  host.readFile = (f) => (synthetic.has(norm(f)) ? synthetic.get(norm(f)) : origReadFile(f));
+  host.fileExists = (f) => (synthetic.has(norm(f)) ? true : origFileExists(f));
+  host.getSourceFile = (fileName, langVersion, onError, shouldCreate) => {
+    if (synthetic.has(norm(fileName))) {
+      return ts.createSourceFile(fileName, synthetic.get(norm(fileName)), langVersion, true);
+    }
+    return origGetSource(fileName, langVersion, onError, shouldCreate);
+  };
+
+  // Pass 1: a program with an empty augmentation, purely to recover member
+  // types by scanning assignments. Pass 2: type-check against the real one.
+  let program = ts.createProgram(rootNames, parsed.options, host);
+  synthetic.set(
+    norm(augPath),
+    analyzer.generate(program, augPath, opts.strict, opts.typoDetection && opts.strict, projections)
+  );
+  program = ts.createProgram(rootNames, parsed.options, host);
+
+  const findings = collectFindings(ts, program, projections, augPath);
+  report(findings, opts.format);
+  process.exit(findings.length ? 1 : 0);
+}
+
+// Map a diagnostic to a user-facing location, translating passage projections
+// back onto the .twee document.
+function collectFindings(ts, program, projections, augPath) {
+  const out = [];
+  for (const sf of program.getSourceFiles()) {
+    if (sf.isDeclarationFile || /[\\/]node_modules[\\/]/.test(sf.fileName)) continue;
+    if (norm(sf.fileName) === norm(augPath)) continue; // never surface the generated file
+    const diags = program.getSemanticDiagnostics(sf);
+    const projection = projections.get(norm(sf.fileName));
+    for (const d of diags) {
+      if (typeof d.start !== "number") continue;
+      const finding = { code: d.code, message: ts.flattenDiagnosticMessageText(d.messageText, "\n"), category: ts.DiagnosticCategory[d.category] };
+      if (projection) {
+        // A diagnostic inside a projection must map to author text or be dropped
+        // — the projection contains scaffolding the author never wrote.
+        const mapped = twee.tsRangeToTwee(projection.segments, d.start, d.length || 1);
+        if (!mapped) continue;
+        finding.file = projection.source;
+        Object.assign(finding, offsetToLineCol(readOr(projection.source), mapped.start));
+      } else {
+        finding.file = sf.fileName;
+        const lc = sf.getLineAndCharacterOfPosition(d.start);
+        finding.line = lc.line + 1;
+        finding.column = lc.character + 1;
+      }
+      out.push(finding);
+    }
+  }
+  out.sort((a, b) => (a.file === b.file ? a.line - b.line : a.file < b.file ? -1 : 1));
+  return out;
+}
+
+function readOr(file) {
+  try { return fs.readFileSync(file, "utf8"); } catch (e) { return ""; }
+}
+function offsetToLineCol(text, offset) {
+  const before = text.slice(0, offset);
+  return { line: before.split("\n").length, column: offset - (before.lastIndexOf("\n") + 1) + 1 };
+}
+
+function report(findings, format) {
+  if (format === "json") {
+    process.stdout.write(JSON.stringify({ findings }, null, 2) + "\n");
+    return;
+  }
+  if (!findings.length) {
+    process.stdout.write("tw-sugarcube-lint: no problems found\n");
+    return;
+  }
+  const rel = (f) => path.relative(process.cwd(), f).replace(/\\/g, "/");
+  for (const f of findings) {
+    process.stdout.write(`${rel(f.file)}:${f.line}:${f.column}  ${f.category.toLowerCase()}  TS${f.code}  ${f.message}\n`);
+  }
+  const errors = findings.filter((f) => f.category === "Error").length;
+  process.stdout.write(`\n${findings.length} problem${findings.length === 1 ? "" : "s"} (${errors} error${errors === 1 ? "" : "s"})\n`);
+}
+
+main();
