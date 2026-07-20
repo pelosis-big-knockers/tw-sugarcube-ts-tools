@@ -1,8 +1,8 @@
 # Twine SugarCube TypeScript Tools
 
-A VS Code extension that makes SugarCube's assignment-populated containers
-genuinely typed in TypeScript/JavaScript story code — with nothing to wire up per
-file and no change to how you write:
+Makes SugarCube's assignment-populated containers genuinely typed — in
+TypeScript/JavaScript story code **and inside `.twee` passages** — with nothing to
+wire up per file and no change to how you write:
 
 ```ts
 setup.attack = (power: number): number => power * 2;   // define anywhere
@@ -13,52 +13,111 @@ const s: string = State.variables.hp;  // -> Type 'number' is not assignable to 
 State.variables.setInAPassage;         // -> any, no error (see below)
 ```
 
+```
+:: Combat
+<<set $hp to 100>>
+<<run setup.attack($hp)>>            <-- $hp is a number, setup.attack is checked
+<<run setup.attack("nope")>>         <-- Argument of type 'string' is not assignable
+```
+
 ## What it does
 
-The plugin scans your `.ts`/`.js` files for assignments to SugarCube's
-author-facing containers — `setup`, `State.variables`, `State.temporary`, and
-`settings` — recovers each member's **type** from its assignment, and feeds a
-generated module augmentation into the project. TypeScript then types those
-members natively, so you get:
+The plugin scans your `.ts`/`.js` files **and the code embedded in `.twee`
+passages** for assignments to SugarCube's author-facing containers — `setup`,
+`State.variables`, `State.temporary`, and `settings` — recovers each member's
+**type** from its assignment, and feeds a generated module augmentation into the
+project. TypeScript then types those members natively, so you get:
 
-- **real types on hover** — `(property) SugarCubeSetupObject["attack"]: (power: number) => number`
+- **real types on hover** — `(property) SugarCubeSetupObject.attack: (power: number) => number`
 - **parameter and arity checking**
 - **return types that flow** — `const dmg = setup.attack(5)` is `number`, not `any`
-- **typed story variables**
-- **completion**, and **go-to-definition redirected to the assignment** (not the
-  generated declaration)
+- **typed story variables**, including those created only by `<<set $hp to 10>>`
+- **completion**, and **go-to-definition redirected to the assignment** (a `<<set>>`
+  in a passage, or the `setup.x =` in your source — never the generated declaration)
 
 Because the members are genuinely declared, `keyof typeof setup` is meaningful —
 useful for dynamic access: `const k: keyof typeof setup = "attack"; setup[k] = …`.
 
 You need **no `.d.ts` in your project**. Engine globals (`State`, `Story`, `$`,
 `Config`, …) come from [`@types/twine-sugarcube`](https://www.npmjs.com/package/@types/twine-sugarcube);
-load them with `"types": ["twine-sugarcube"]` in your `tsconfig.json` (which is
-what `tw-server init` writes).
+load them with `"types": ["twine-sugarcube"]` in your `tsconfig.json`.
 
-Only `.ts`/`.js` files are covered. Intelligence inside `.twee` passages
-(`<<run setup.foo()>>`, `<<set $hp to 10>>`) is planned separately.
+## Passages (`.twee`)
+
+Inside passages you get hover, completion, go-to-definition, and diagnostics for
+`setup`/variable members in macro code — `<<= >>`, `<<print>>`, `<<run>>`,
+`<<set>>`, `<<if>>`, sigils (`$hp`, `_scratch`), and SugarCube's word operators
+(`gt`, `is`, `and`, …). A `<<set $hp to 10>>` types the variable everywhere,
+including in `.ts` files that read it.
+
+Two features are workarounds for a bug in **Twee 3 Language Tools ≤ 0.34.0**,
+whose definition provider never resolves and blocks native ctrl+click for *every*
+extension in `.twee` files (see `docs/twee3-language-tools-definition-hang.md`).
+Both default **off**:
+
+- **`twSugarcube.passageLinks`** — makes members ctrl+clickable as document links.
+  VS Code always underlines document links, so leave it off unless you need the
+  gesture and can't fix Twee 3 Language Tools.
+- **`twSugarcube.passageGoToDefinition`** — binds F12 in passages to this
+  extension's own go-to-definition, bypassing the aggregation the bug hangs.
+
+With a fixed Twee 3 Language Tools, native F12/ctrl+click work and neither is
+needed.
 
 ## Members created outside TypeScript
 
 Every container keeps an open index signature (`[key: string]: any`), because
 members are routinely created where this plugin can't see them:
 
-- `<<set $hp to 1>>` in a passage
-- `Setting.addToggle(...)` creating a `settings` entry
-- a computed `setup[someString] = …`
+- a `settings` entry from `Setting.addToggle(...)`
+- a computed `setup[someString] = …` or `Object.assign(setup, …)`
+- an assignment in a `.js` file outside the TypeScript project
 
-So reading a member that was never assigned in `.ts` gives you `any` rather than
-an error. Members that *were* assigned still take precedence over the index
-signature, so their types are checked as normal — you get typing where it's known
-and quiet everywhere else.
-
-The trade-off is that misspelling a member can't be reported (it just resolves to
-`any`). Catching typos would require knowing every assignment site, including
-passages — which is what the planned `.twee` support would provide.
+So reading a member that was never assigned gives you `any` rather than an error.
+Members that *were* assigned still take precedence over the index signature, so
+their types are checked as normal — you get typing where it's known and quiet
+everywhere else.
 
 If typing is ever wrong for your story, set **`twSugarcube.strict: false`** to drop
 the recovered types entirely; completion and go-to-definition keep working.
+
+### Typo detection (opt-in)
+
+Set **`twSugarcube.typoDetection: true`** (requires `strict`) to close the
+containers, so a member that was never assigned anywhere becomes an error:
+
+```ts
+setup.attck(1);   // -> Property 'attck' does not exist. Did you mean 'attack'?
+```
+
+This is off by default because it's only sound when every member is created by an
+assignment the plugin can see. `settings` is never closed (its members come from
+the Setting API), and any `Object.assign` / computed assignment reopens its
+container — so a story that populates members dynamically will report false
+positives. Turn it on only if you assign `setup`/variable members by plain
+assignment or `<<set>>`.
+
+## Command-line linter
+
+`tw-sugarcube-lint` runs the same analysis over a whole project, for a pre-commit
+hook or CI:
+
+```sh
+npx tw-sugarcube-lint .            # type-check .ts/.js and passage code
+npx tw-sugarcube-lint . --typos    # + report never-assigned members
+npx tw-sugarcube-lint . --json     # machine-readable
+```
+
+It builds a program from your `tsconfig.json`, checks passage code the same way
+the editor does, and maps errors back onto `.twee` spans. Exit code is **0** when
+clean, **1** on findings, **2** if the linter itself couldn't run — so CI just
+checks the exit code. It shares the exact analysis core the editor uses, so the
+two can't disagree.
+
+The linter needs the JavaScript compiler API, which the **native TypeScript 7.x**
+compiler does not expose. If your project is on 7.x, it falls back to the
+TypeScript bundled with this tool (a 6.x line) and says so; the analysis is
+unaffected.
 
 ## Why an extension (and not a tsconfig plugin)
 
@@ -69,29 +128,39 @@ mechanism the Svelte and Angular extensions use.
 
 ## How the generated types reach the project
 
-Worth knowing before changing any of it:
+Worth knowing before changing any of it — each point below was established by
+driving a real tsserver, and the reasoning is in the code comments:
 
-- `getExternalFiles` registers the generated file with the project, which is what
-  makes tsserver create a real `ScriptInfo` for it. **Adding a name to the host's
-  `getScriptFileNames()` instead makes `ProjectService.setDocument` throw
-  "Debug Failure" and crashes the language service.**
-- The content is served from memory by patching `info.serverHost`; nothing is ever
+- `getExternalFiles` registers the generated file (and each passage projection)
+  with the project, which is what makes tsserver create a real `ScriptInfo`.
+  **Adding a name to the host's `getScriptFileNames()` instead makes
+  `ProjectService.setDocument` throw "Debug Failure" and crashes the language
+  service.**
+- Content is served from memory by patching `info.serverHost`; nothing is ever
   written to your workspace.
-- tsserver's file watcher for that path is captured and fired on regeneration, so
-  types refresh live as you edit.
+- Content is generated **eagerly in `create()`**, because the file is read before
+  the first language-service call.
+- Regeneration is published by reloading the `ScriptInfo` and marking the project
+  dirty. tsserver never fires a watcher for these paths on its own (there's no file
+  on disk to observe), so that is the only delivery mechanism — a captured
+  `watchFile` callback added nothing but a race against other global plugins.
 
 ## Development
 
 ```sh
 npm install          # installs the bundled plugin, vsce, and test deps
-npm test             # drives a REAL tsserver against test/fixture*
-npm run package      # runs the smoke test, then produces the .vsix
+npm test             # projection unit tests, transport tests, real-tsserver
+                     #   smoke tests, and the CLI tests
+npm run package      # runs the tests, then produces the .vsix
 ```
 
-`npm test` spawns an actual tsserver with the plugin loaded as a global plugin and
-asserts on real diagnostics. A hand-rolled `ts.createLanguageService` host does
-**not** represent tsserver — it has no `ProjectService`, so it silently accepts
-things that crash the real server. Any change to file injection must be verified
-by this test; `npm run package` will not build a `.vsix` unless it passes.
+The smoke test spawns an actual tsserver — the same TypeScript version VS Code
+bundles — with the plugin loaded as a global plugin (alongside decoy plugins,
+since ordering bugs only appear with more than one loaded) and asserts on real
+diagnostics. A hand-rolled `ts.createLanguageService` host does **not** represent
+tsserver: it has no `ProjectService`, so it silently accepts things that crash the
+real server. Any change to file injection must be verified by this test;
+`npm run package` will not build a `.vsix` unless everything passes.
 
 Install the `.vsix` via **Extensions: Install from VSIX…**, then reload.
+```
