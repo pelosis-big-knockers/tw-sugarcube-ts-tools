@@ -112,7 +112,7 @@ function collectProjections(root) {
       if (entry.isDirectory()) {
         if (entry.name === "node_modules" || entry.name[0] === ".") continue;
         walk(full, depth + 1);
-      } else if (/\.(twee|tw)$/i.test(entry.name)) {
+      } else if (twee.isTweeFile(entry.name)) {
         let text = "";
         try { text = fs.readFileSync(full, "utf8"); } catch (e) { continue; }
         let projected = { ts: "", segments: [] };

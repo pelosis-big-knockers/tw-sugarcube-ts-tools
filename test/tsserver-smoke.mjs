@@ -249,6 +249,81 @@ async function main() {
   check("no projected file written to the workspace",
     !existsSync(path.join(tweeFixture, "story.twee.ts")), "projection leaked to disk");
 
+  // ---------- a .twee CREATED after the project loaded ----------
+  // A newly created (or renamed) .twee never touches a .ts file, so nothing
+  // re-runs getExternalFiles — and even when it does, getExternalFiles is only
+  // concatenated into the project's ROOT files on a config reload, so the new
+  // projection isn't a program root. The plugin watches the directory and
+  // reloads the project on a structural change. Without that, the editor gets
+  // "No Project" for every freshly created passage file.
+  console.log("\npassage file created after load:");
+  const newFixture = path.join(testDir, "fixture-twee-new");
+  const newWorld = toPosix(path.join(newFixture, "world.ts"));
+  const createdTwee = path.join(newFixture, "created.twee");
+  const createdProjected = toPosix(createdTwee) + ".ts";
+  rmSync(createdTwee, { force: true }); // ensure it's absent at load
+  const newRun = await withServer(newFixture, async ({ proj, send, wait, lastOf }) => {
+    send("open", { file: newWorld, projectRootPath: proj });
+    await wait(2600);
+
+    // Create the passage AFTER the project is up — the user's scenario.
+    writeFileSync(createdTwee, ":: Start\n<<run setup.attack(3)>>\n");
+    await wait(1600); // watcher debounce (150ms) + project reload
+
+    send("quickinfo", { file: createdProjected, line: 1, offset: 8 });
+    await wait(900);
+    const hover = lastOf("quickinfo")?.body?.displayString ?? "";
+    check("a passage created after load is analyzed without a reload",
+      /attack: \(power: number\) => number/.test(hover),
+      hover || JSON.stringify(lastOf("quickinfo")?.message || "(no response)"));
+  });
+  rmSync(createdTwee, { force: true });
+  check("no language-service crash (created passage)", !newRun.crashed, "Debug Failure seen");
+
+  // ---------- live (unsaved) passage buffers ----------
+  // tsserver only sees disk, and updateOpen is blocked by the request allowlist,
+  // so the editor pushes the raw twee text through configurePlugin and the plugin
+  // overrides disk with it. This is how passage intelligence tracks an unsaved
+  // buffer. Disk stays valid throughout; we push an erroring version, a corrected
+  // version, then clear the override and confirm it reverts to disk.
+  console.log("\nlive (unsaved) passage buffer:");
+  const liveFixture = path.join(testDir, "fixture-twee-live");
+  const liveWorld = toPosix(path.join(liveFixture, "world.ts"));
+  const liveTweePath = toPosix(path.join(liveFixture, "story.twee"));
+  const liveProjected = liveTweePath + ".ts";
+  const liveDiskBefore = readFileSync(path.join(liveFixture, "story.twee"), "utf8");
+  const pushLive = (send, text) =>
+    send("configurePlugin", { pluginName: "tw-sugarcube-ts-plugin", configuration: { strict: true, liveDoc: { path: liveTweePath, text } } });
+  const liveRun = await withServer(liveFixture, async ({ proj, send, wait, diagnostics }) => {
+    send("open", { file: liveWorld, projectRootPath: proj });
+    await wait(2600);
+
+    // Unsaved edit introducing a type error.
+    pushLive(send, ':: Start\n<<run setup.attack("wrong")>>\n');
+    await wait(1200);
+    send("semanticDiagnosticsSync", { file: liveProjected });
+    await wait(1400);
+    check("an unsaved edit's error is reflected without a save",
+      diagnostics().some((d) => /not assignable to parameter of type 'number'/.test(d)), diagnostics().join(" | "));
+
+    // Corrected unsaved edit.
+    pushLive(send, ":: Start\n<<run setup.attack(42)>>\n");
+    await wait(1200);
+    send("semanticDiagnosticsSync", { file: liveProjected });
+    await wait(1400);
+    check("correcting the unsaved buffer clears the error", diagnostics().length === 0, diagnostics().join(" | "));
+
+    // Close: clear the override, revert to disk (which is valid).
+    pushLive(send, null);
+    await wait(1200);
+    send("semanticDiagnosticsSync", { file: liveProjected });
+    await wait(1400);
+    check("clearing the override reverts to disk", diagnostics().length === 0, diagnostics().join(" | "));
+  });
+  check("no language-service crash (live buffer)", !liveRun.crashed, "Debug Failure seen");
+  check("disk file untouched by live editing",
+    readFileSync(path.join(liveFixture, "story.twee"), "utf8") === liveDiskBefore, "disk changed");
+
   // ---------- passage assignments as a type source ----------
   // `<<set $hp to 100>>` is how most story variables come into existence, so it
   // is the main source of their types. The fixture's .ts file only READS them.

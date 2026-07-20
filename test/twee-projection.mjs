@@ -142,6 +142,15 @@ eq("a macro containing >> inside a string still closes correctly",
     JSON.stringify(mismatched.slice(0, 3)));
 }
 
+// --- recognized file extensions --------------------------------------------
+// tweego's Twee source set: .tw, .twee, and the Twee2 variants .tw2, .twee2.
+check("all four tweego twee extensions are recognized",
+  ["a.tw", "a.twee", "a.tw2", "a.twee2"].every((f) => project && require(
+    path.join(path.dirname(testDir), "ts-plugin", "twee.js")).isTweeFile(f)));
+check("non-twee extensions are not recognized",
+  !["a.ts", "a.js", "a.twx", "a.tw3"].some((f) => require(
+    path.join(path.dirname(testDir), "ts-plugin", "twee.js")).isTweeFile(f)));
+
 const failed = results.filter((r) => !r.ok);
 console.log(`\n${results.length - failed.length}/${results.length} checks passed`);
 if (failed.length) {

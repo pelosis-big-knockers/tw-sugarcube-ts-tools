@@ -22,10 +22,12 @@
 // `definitionAndBoundSpan` and `updateOpen` are NOT. Two consequences shape
 // everything below:
 //
-//   1. We cannot push the live buffer to tsserver (`updateOpen` is blocked), so
-//      tsserver only ever sees the projection of the file AS SAVED. Offering
-//      features against a dirty buffer would map answers onto stale positions,
-//      so they are suppressed until save.
+//   1. `updateOpen` is blocked, so we can't push a buffer to tsserver the normal
+//      way. Instead the plugin accepts the raw twee text via `configurePlugin`
+//      and overrides disk with it (see pushLiveText / clearLiveText), so passage
+//      intelligence tracks the UNSAVED buffer. Before the live channel existed,
+//      features were suppressed on a dirty document because tsserver only saw the
+//      saved file; now they aren't.
 //   2. Go-to-definition cannot come from tsserver, so it is resolved here by
 //      scanning the workspace for the assignment that created the member.
 // ---------------------------------------------------------------------------
@@ -33,7 +35,7 @@ const vscode = require("vscode");
 const twee = require("./ts-plugin/twee.js");
 
 const TSSERVER_REQUEST = "typescript.tsserverRequest";
-const SELECTOR = { scheme: "file", pattern: "**/*.{twee,tw}" };
+const SELECTOR = { scheme: "file", pattern: twee.TWEE_GLOB };
 
 // A user-visible log (Output -> "Twine SugarCube Passages"). The provider layer
 // can't be exercised outside a real extension host, so when something here
@@ -114,8 +116,54 @@ async function request(command, args) {
 
 // The projected file's path, matching what the plugin registers.
 const projectedPath = (document) => document.uri.fsPath.split("\\").join("/") + ".ts";
+const tweePath = (document) => document.uri.fsPath.split("\\").join("/");
 
 const projections = new Map(); // document uri -> { text, projection }
+
+// --- live (unsaved) buffers -------------------------------------------------
+// tsserver only ever sees files on disk, and the request allowlist blocks
+// updateOpen, so the extension can't push a buffer the normal way. Instead the
+// plugin accepts the raw twee text through configurePlugin and overrides disk
+// with it. We push the live text (debounced) as the user types, so passage
+// intelligence tracks the buffer without a save, and clear the override when the
+// document closes so the plugin reverts to disk.
+const PLUGIN_ID = "tw-sugarcube-ts-plugin";
+const pushed = new Map(); // twee path -> last text pushed, to skip no-op sends
+let tsApi = null;
+
+function setLiveApi(api) { tsApi = api; }
+
+function pushLiveText(document, text) {
+  if (!tsApi || typeof tsApi.configurePlugin !== "function") return;
+  const path = tweePath(document);
+  if (pushed.get(path) === text) return; // nothing changed since the last push
+  pushed.set(path, text);
+  try {
+    tsApi.configurePlugin(PLUGIN_ID, {
+      strict: vscode.workspace.getConfiguration("twSugarcube").get("strict", true),
+      typoDetection: vscode.workspace.getConfiguration("twSugarcube").get("typoDetection", false),
+      liveDoc: { path, text },
+    });
+  } catch (e) {
+    log(`configurePlugin (live push) failed: ${e && e.message}`);
+  }
+}
+
+function clearLiveText(document) {
+  if (!tsApi || typeof tsApi.configurePlugin !== "function") return;
+  const path = tweePath(document);
+  if (!pushed.has(path)) return;
+  pushed.delete(path);
+  try {
+    tsApi.configurePlugin(PLUGIN_ID, {
+      strict: vscode.workspace.getConfiguration("twSugarcube").get("strict", true),
+      typoDetection: vscode.workspace.getConfiguration("twSugarcube").get("typoDetection", false),
+      liveDoc: { path, text: null },
+    });
+  } catch (e) {
+    log(`configurePlugin (live clear) failed: ${e && e.message}`);
+  }
+}
 
 function projectionOf(document) {
   const key = document.uri.toString();
@@ -132,10 +180,10 @@ function projectionOf(document) {
   return projection;
 }
 
-// tsserver's copy comes from disk, so a dirty buffer would have us map answers
-// onto positions that have since moved. Better to go quiet than to point at the
-// wrong span.
-const usable = (document) => !document.isDirty && !!projectionOf(document).ts.trim();
+// The plugin serves the live buffer we push (see pushLiveText), so a dirty
+// document is fine — tsserver's copy matches our projection. It's only unusable
+// when there's no projected code at all.
+const usable = (document) => !!projectionOf(document).ts.trim();
 
 // tsserver speaks 1-based line/offset; VS Code speaks 0-based line/character.
 function toTsPosition(text, offset) {
@@ -152,6 +200,11 @@ function offsetOfTsPosition(text, line, offset) {
 
 function locate(document, position) {
   if (!usable(document)) return null;
+  // Make sure tsserver has this exact buffer before we query it. The debounced
+  // change handler usually got here first; this covers a query fired inside the
+  // debounce window. tsserver processes requests in order, so the configurePlugin
+  // push lands before the quickinfo/completion request that follows.
+  pushLiveText(document, document.getText());
   const projection = projectionOf(document);
   const tsOffset = twee.tweeOffsetToTs(projection.segments, document.offsetAt(position));
   if (tsOffset === null) return null;
@@ -439,6 +492,8 @@ function register(context) {
   async function refresh(document) {
     if (!vscode.languages.match(SELECTOR, document)) return;
     if (!usable(document)) { diagnostics.delete(document.uri); return; }
+    // Push the current buffer, then query — tsserver applies the two in order.
+    pushLiveText(document, document.getText());
     const projection = projectionOf(document);
     const body = await request("semanticDiagnosticsSync", { file: projectedPath(document) });
     if (!Array.isArray(body)) { diagnostics.delete(document.uri); return; }
@@ -461,16 +516,30 @@ function register(context) {
     diagnostics.set(document.uri, out);
   }
 
+  // Push the live buffer as the user types, debounced so we don't reconfigure
+  // the plugin on every keystroke, then refresh diagnostics from it.
+  const debounced = new Map(); // uri -> timeout handle
+  function onEdit(document) {
+    if (!vscode.languages.match(SELECTOR, document)) return;
+    const key = document.uri.toString();
+    if (debounced.has(key)) clearTimeout(debounced.get(key));
+    debounced.set(key, setTimeout(() => {
+      debounced.delete(key);
+      pushLiveText(document, document.getText());
+      refresh(document);
+    }, 200));
+  }
+
   context.subscriptions.push(
     hover, completion, definition, links, goToDefinition, diagnostics,
     vscode.workspace.onDidOpenTextDocument((doc) => refresh(doc)),
-    // tsserver only ever sees the saved file, so save is the meaningful trigger.
     vscode.workspace.onDidSaveTextDocument((doc) => refresh(doc)),
-    vscode.workspace.onDidChangeTextDocument((event) => {
-      if (event.document.isDirty) diagnostics.delete(event.document.uri);
-    }),
+    vscode.workspace.onDidChangeTextDocument((event) => onEdit(event.document)),
     vscode.workspace.onDidCloseTextDocument((doc) => {
-      projections.delete(doc.uri.toString());
+      const key = doc.uri.toString();
+      if (debounced.has(key)) { clearTimeout(debounced.get(key)); debounced.delete(key); }
+      clearLiveText(doc); // plugin reverts to disk for this file
+      projections.delete(key);
       diagnostics.delete(doc.uri);
     })
   );
@@ -507,6 +576,7 @@ const ALLOWED_COMMANDS = [
 
 module.exports = {
   register,
+  setLiveApi,
   ALLOWED_COMMANDS,
   // exposed for tests
   __test: { memberAtProjection, CONTAINERS, toTsPosition, offsetOfTsPosition, tsserverAvailable },

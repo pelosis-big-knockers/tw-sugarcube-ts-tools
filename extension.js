@@ -26,6 +26,11 @@ async function activate(context) {
     : undefined;
   if (!api) return;
 
+  // Let the passage features push live (unsaved) buffers to the plugin. Both
+  // this send() and the live push go through configurePlugin; the plugin merges
+  // them, and a settings-only send has no liveDoc so it never clears an override.
+  passages.setLiveApi(api);
+
   const send = () => {
     const config = vscode.workspace.getConfiguration(SECTION);
     api.configurePlugin(PLUGIN_ID, {

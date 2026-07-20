@@ -109,6 +109,16 @@ console.log("lint CLI\n");
     `exit ${r.code}: ${r.out}`);
 }
 
+// --- all four tweego source extensions are analyzed ------------------------
+// tweego recognizes .tw, .twee, .tw2, .twee2; the extension must cover the whole
+// set, not just the two Twee 3 Language Tools associates.
+{
+  const r = lint("fixture-lint-ext");
+  check("a .twee2 passage error is reported", /story\.twee2:2:\d+.*not assignable/.test(r.out), r.out);
+  check("...and a .tw2 passage projects without spurious errors",
+    !/extra\.tw2/.test(r.out) && r.out.split("\n").filter((l) => /:\d+:\d+  error/.test(l)).length === 1, r.out);
+}
+
 // --- the tool runs from any cwd (CI invokes it oddly) ----------------------
 {
   const r = spawnSync(process.execPath, [CLI, path.join(testDir, "fixture-lint")], { encoding: "utf8", cwd: repoRoot });

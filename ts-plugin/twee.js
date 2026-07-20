@@ -273,4 +273,17 @@ function tsRangeToTwee(segments, start, length) {
   return { start: from, length: Math.max(1, to - from) };
 }
 
-module.exports = { project, tsOffsetToTwee, tweeOffsetToTs, tsRangeToTwee };
+// The Twee source extensions tweego recognizes: .tw / .twee, plus the Twee2
+// variants .tw2 / .twee2. Defined once here so the plugin, the editor providers,
+// and the CLI can't drift (package.json's static globs mirror this list — keep
+// them in sync when this changes).
+const TWEE_EXTENSIONS = ["twee", "tw", "twee2", "tw2"];
+const TWEE_FILE_RE = new RegExp(`\\.(${TWEE_EXTENSIONS.join("|")})$`, "i");
+const isTweeFile = (name) => TWEE_FILE_RE.test(name);
+// A VS Code DocumentSelector glob, e.g. "**/*.{twee,tw,twee2,tw2}".
+const TWEE_GLOB = `**/*.{${TWEE_EXTENSIONS.join(",")}}`;
+
+module.exports = {
+  project, tsOffsetToTwee, tweeOffsetToTs, tsRangeToTwee,
+  TWEE_EXTENSIONS, TWEE_FILE_RE, isTweeFile, TWEE_GLOB,
+};

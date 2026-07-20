@@ -44,6 +44,12 @@ function init(modules) {
     return states.get(key);
   };
   let hostPatched = false;
+  let dirWatcher = null;
+  // create() registers its per-project config handler here. tsserver calls
+  // onConfigurationChanged on the MODULE object (what init returns), NOT on the
+  // language-service proxy — verified in tsserver's onPluginConfigurationChanged
+  // — so the module must forward to create()'s scope, where refresh/liveText live.
+  let activeConfigHandler = null;
 
   // ---- passages -----------------------------------------------------------
   // Each .twee file gets a virtual .ts sibling holding its projected passage
@@ -76,7 +82,7 @@ function init(modules) {
       if (entry.isDirectory()) {
         if (entry.name === "node_modules" || entry.name[0] === ".") continue;
         findTweeFiles(full, out, depth + 1);
-      } else if (/\.(twee|tw)$/i.test(entry.name)) {
+      } else if (twee.isTweeFile(entry.name)) {
         out.push(full);
       }
     }
@@ -97,6 +103,25 @@ function init(modules) {
   // by whoever is in a position to act on it.
   const pendingReload = new Set();
 
+  // Unsaved editor content, keyed by normalized twee path -> raw twee text.
+  // The plugin runs inside tsserver and cannot see VS Code's dirty buffers, so
+  // the extension pushes the live text through configurePlugin. While an entry
+  // exists, it overrides what's on disk, so passage intelligence reflects the
+  // buffer without a save. Cleared when the document closes (back to disk).
+  const liveText = new Map();
+
+  function projectInto(key, virtual, source, text, mtime) {
+    let content = "";
+    let segments = [];
+    // A malformed passage must never take down the language service.
+    try {
+      const projected = twee.project(text);
+      content = projected.ts;
+      segments = projected.segments;
+    } catch (e) { content = ""; segments = []; }
+    tweeFiles.set(key, { content, mtime, segments, virtual, source });
+  }
+
   function syncTweeVirtuals(dir, options) {
     const force = !!(options && options.force);
     if (!force && Date.now() - lastScan < RESCAN_INTERVAL_MS) {
@@ -110,24 +135,25 @@ function init(modules) {
       const key = norm(virtual);
       let mtime = 0;
       try { mtime = fsMod.statSync(file).mtimeMs; } catch (e) { continue; }
+      const source = String(file).replace(/\\/g, "/");
       const cached = tweeFiles.get(key);
-      if (!cached || cached.mtime !== mtime) {
-        changed.push(virtual);
-        pendingReload.add(virtual);
+      // A live override always wins over disk, and is re-projected whenever its
+      // text changes (tracked by cached.liveText identity) rather than by mtime.
+      const live = liveText.get(key);
+      if (live !== undefined) {
+        if (!cached || cached.liveText !== live) {
+          changed.push(virtual);
+          pendingReload.add(virtual);
+          projectInto(key, virtual, source, live, mtime);
+          tweeFiles.get(key).liveText = live;
+        }
+      } else if (!cached || cached.mtime !== mtime || cached.liveText !== undefined) {
+        // No override (or one was just cleared): (re)project from disk.
         let text = "";
         try { text = fsMod.readFileSync(file, "utf8"); } catch (e) { continue; }
-        let content = "";
-        let segments = [];
-        // A malformed passage must never take down the language service.
-        try {
-          const projected = twee.project(text);
-          content = projected.ts;
-          segments = projected.segments;
-        } catch (e) { content = ""; segments = []; }
-        tweeFiles.set(key, {
-          content, mtime, segments, virtual,
-          source: String(file).replace(/\\/g, "/"),
-        });
+        changed.push(virtual);
+        pendingReload.add(virtual);
+        projectInto(key, virtual, source, text, mtime);
       }
       paths.push(virtual);
     }
@@ -262,14 +288,53 @@ function init(modules) {
     // projections stay frozen at whatever they were when the project loaded:
     // a newly added `<<set $enemyName to "Goblin">>` is invisible, and a hover
     // past the end of the stale projection fails outright.
+    // Re-concat getExternalFiles into the project's root files, which is what
+    // turns a newly created/renamed .twee's projection into a program root.
+    // Only a config reload does this; nothing lighter reaches the root set.
+    function reloadProjectRoots() {
+      const svc = info.project.projectService;
+      if (svc && typeof svc.reloadConfiguredProject === "function") {
+        try {
+          // The signature has varied across versions; the two-arg form is current.
+          svc.reloadConfiguredProject(info.project, "tw-sugarcube: passage file set changed");
+          return true;
+        } catch (e1) {
+          try { svc.reloadConfiguredProject(info.project); return true; }
+          catch (e2) { log(`reloadConfiguredProject failed: ${e2 && e2.message}`); }
+        }
+      }
+      return false;
+    }
+
+    // reloadConfiguredProject rebuilds the project, which re-enters our proxy's
+    // language-service methods → refresh() → syncPassages() → reload again,
+    // recursing until the stack blows. syncPassages runs before refresh()'s own
+    // `refreshing` guard is set, so it needs its own re-entrancy guard.
+    let syncing = false;
     function syncPassages() {
+      if (syncing) return false;
+      syncing = true;
+      try {
+        return syncPassagesInner();
+      } finally {
+        syncing = false;
+      }
+    }
+
+    function syncPassagesInner() {
       syncTweeVirtuals(info.project.getCurrentDirectory());
       if (!pendingReload.size) return false;
       // Drain: a path stays pending until someone reloads its ScriptInfo, which
       // is only possible once tsserver has created one for it.
       const files = [...pendingReload];
       pendingReload.clear();
-      for (const missed of invalidate(files)) pendingReload.add(missed);
+      // Content-only refresh: reload the ScriptInfos that already exist. A file
+      // with no ScriptInfo yet (a newly created/renamed .twee) simply stays
+      // pending — making it a program ROOT needs a project reload, which is a
+      // structural operation the directory watcher performs, never from inside a
+      // language-service call (that recurses through the proxy). See onTweeEvent.
+      const missed = invalidate(files);
+      for (const m of missed) pendingReload.add(m);
       const done = files.length - pendingReload.size;
       if (done > 0) log(`re-projected ${done} passage file(s)`);
       return done > 0;
@@ -372,7 +437,19 @@ function init(modules) {
       };
     };
 
-    proxy.onConfigurationChanged = (config) => {
+    activeConfigHandler = (config) => {
+      // Live passage buffers pushed from the extension (it can see unsaved text;
+      // the plugin can't). `{ path, text }` sets an override; `text === null`
+      // clears it (document closed) and reverts to disk.
+      const live = config && config.liveDoc;
+      if (live && typeof live.path === "string") {
+        const key = norm(twee.isTweeFile(live.path) ? live.path + ".ts" : live.path);
+        if (live.text === null || live.text === undefined) liveText.delete(key);
+        else liveText.set(key, String(live.text));
+        lastScan = 0; // a live edit must bypass the rescan throttle
+        syncPassages();
+      }
+
       const nextStrict = readStrict(config);
       const nextTypos = readTypos(config);
       if (nextStrict === strict && nextTypos === typoDetection) return;
@@ -390,11 +467,62 @@ function init(modules) {
     refresh();
     log(`ready (${state.content.length} bytes generated, strict=${strict}, typoDetection=${typoDetection})`);
 
+    // Watch the project for .twee files appearing, disappearing, or being
+    // renamed. Editing an EXISTING passage is picked up by refresh() (a .ts
+    // language-service call re-syncs from disk), but a brand-new or renamed
+    // .twee never touches a .ts file, so without this its projection is never
+    // registered and the editor gets "No Project" for it. tsserver won't watch
+    // .twee itself — it's not TypeScript and nothing it owns imports it — so the
+    // plugin watches on its own behalf.
+    if (!dirWatcher && typeof info.serverHost.watchDirectory === "function") {
+      // The set of registered projection paths, so a filesystem event can be
+      // classified as structural (a .twee added or removed → the project's root
+      // files must be rebuilt) or content-only (an existing .twee edited → just
+      // reload its ScriptInfo).
+      const knownPaths = () => new Set([...tweeFiles.keys()]);
+      let pending = null;
+      const onTweeEvent = () => {
+        lastScan = 0; // a real filesystem event bypasses the throttle
+        const before = knownPaths();
+        syncTweeVirtuals(info.project.getCurrentDirectory(), { force: true });
+        const after = knownPaths();
+        const structural = before.size !== after.size ||
+          [...after].some((p) => !before.has(p));
+        if (structural) {
+          // A new/renamed/deleted .twee changes which files exist. Only a config
+          // reload re-concats getExternalFiles into the program's roots (a plain
+          // markAsDirty rebuilds from the existing roots and never picks it up).
+          // Safe here because we're in a watcher callback, outside any
+          // language-service request. See reloadProjectRoots.
+          reloadProjectRoots();
+        }
+        syncPassages(); // reload content of whatever now has a ScriptInfo
+      };
+      const onChange = (changedPath) => {
+        if (!twee.isTweeFile(changedPath) && !/\.(twee|tw|twee2|tw2)\.ts$/i.test(changedPath)) return;
+        // Debounce: a rename fires delete+create; an editor save can fire twice.
+        if (pending) info.serverHost.clearTimeout(pending);
+        pending = info.serverHost.setTimeout(() => { pending = null; onTweeEvent(); }, 150);
+      };
+      try {
+        dirWatcher = info.serverHost.watchDirectory(
+          info.project.getCurrentDirectory(), onChange, /*recursive*/ true, {}
+        );
+        log("watching the project for .twee changes");
+      } catch (e) {
+        log(`could not watch the project directory: ${e && e.message}`);
+      }
+    }
+
     return proxy;
   }
 
   return {
     create,
+    // tsserver dispatches configurePlugin here, on the module object.
+    onConfigurationChanged(config) {
+      if (activeConfigHandler) activeConfigHandler(config);
+    },
     getExternalFiles(project) {
       const virtualFile = virtualFor(project.getCurrentDirectory());
       stateFor(virtualFile);

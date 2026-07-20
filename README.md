@@ -42,13 +42,15 @@ You need **no `.d.ts` in your project**. Engine globals (`State`, `Story`, `$`,
 `Config`, …) come from [`@types/twine-sugarcube`](https://www.npmjs.com/package/@types/twine-sugarcube);
 load them with `"types": ["twine-sugarcube"]` in your `tsconfig.json`.
 
-## Passages (`.twee`)
+## Passages (`.tw`, `.twee`, `.tw2`, `.twee2`)
 
-Inside passages you get hover, completion, go-to-definition, and diagnostics for
+All four Twee source extensions tweego recognizes are covered. Inside passages you
+get hover, completion, go-to-definition, and diagnostics for
 `setup`/variable members in macro code — `<<= >>`, `<<print>>`, `<<run>>`,
 `<<set>>`, `<<if>>`, sigils (`$hp`, `_scratch`), and SugarCube's word operators
 (`gt`, `is`, `and`, …). A `<<set $hp to 10>>` types the variable everywhere,
-including in `.ts` files that read it.
+including in `.ts` files that read it. Passages update **live** — you don't have
+to save first; the unsaved buffer is pushed to the language service as you type.
 
 Two features are workarounds for a bug in **Twee 3 Language Tools ≤ 0.34.0**,
 whose definition provider never resolves and blocks native ctrl+click for *every*

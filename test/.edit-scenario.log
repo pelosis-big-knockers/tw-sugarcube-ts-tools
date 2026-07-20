@@ -1,4 +1,5 @@
-Info 29   [11:08:58.455] [tw-sugarcube] serverHost patched
-Info 37   [11:08:58.464] [tw-sugarcube] ready (330 bytes generated, strict=true, typoDetection=false)
-Info 95   [11:09:01.022] [tw-sugarcube] re-projected 1 passage file(s)
-Info 125  [11:09:05.753] [tw-sugarcube] re-projected 1 passage file(s)
+Info 29   [12:38:45.720] [tw-sugarcube] serverHost patched
+Info 37   [12:38:45.729] [tw-sugarcube] ready (330 bytes generated, strict=true, typoDetection=false)
+Info 39   [12:38:45.729] [tw-sugarcube] watching the project for .twee changes
+Info 97   [12:38:48.280] [tw-sugarcube] re-projected 1 passage file(s)
+Info 127  [12:38:53.014] [tw-sugarcube] re-projected 1 passage file(s)
