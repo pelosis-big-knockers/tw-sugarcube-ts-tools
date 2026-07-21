@@ -332,37 +332,72 @@ function project(text) {
 
 // --- position mapping -------------------------------------------------------
 
-function tsOffsetToTwee(segments, offset) {
+// Find the segment covering an offset in one of the two documents. Adjacent
+// segments share a boundary offset, so which one wins depends on what is being
+// measured: the START of a range opens the following segment, the END of a range
+// closes the preceding one. Getting that backwards is invisible for verbatim
+// text (both sides agree character-for-character) but wrong for a rewritten
+// segment, where every interior offset collapses to one endpoint.
+function findSegment(segments, offset, key, atEnd) {
+  const startKey = key === "ts" ? "tsStart" : "tweeStart";
+  const lengthKey = key === "ts" ? "tsLength" : "tweeLength";
+  let boundary = null;
   for (const s of segments) {
-    if (offset >= s.tsStart && offset <= s.tsStart + s.tsLength) {
-      const delta = offset - s.tsStart;
-      // Exact correspondence when the text wasn't rewritten.
-      if (s.tsLength === s.tweeLength) return s.tweeStart + delta;
-      return s.tweeStart;
-    }
+    const from = s[startKey];
+    const to = from + s[lengthKey];
+    if (offset < from || offset > to) continue;
+    if (atEnd ? offset > from : offset < to) return s;
+    // Only touching this segment's far edge: usable, but keep looking for one
+    // the offset is genuinely inside.
+    if (boundary === null) boundary = s;
   }
-  return null;
+  return boundary;
+}
+
+function tsOffsetToTwee(segments, offset) {
+  const s = findSegment(segments, offset, "ts", false);
+  if (!s) return null;
+  // Exact correspondence when the text wasn't rewritten.
+  if (s.tsLength === s.tweeLength) return s.tweeStart + (offset - s.tsStart);
+  return s.tweeStart;
+}
+
+// The same map for the END of a TS range. Inside a rewritten segment there is no
+// per-character correspondence, so an interior offset collapses to an endpoint —
+// and the end of a range has to collapse to the END of the source token, past
+// the `p` of `$hp`. Collapsing it to the start (and then taking the TypeScript
+// length as the twee length) is what made a diagnostic on
+// `State.variables.test3` underline `$test3.property = "Th`.
+function tsOffsetToTweeEnd(segments, offset) {
+  const s = findSegment(segments, offset, "ts", true);
+  if (!s) return null;
+  if (s.tsLength === s.tweeLength) return s.tweeStart + (offset - s.tsStart);
+  return s.tweeStart + s.tweeLength;
 }
 
 function tweeOffsetToTs(segments, offset) {
-  for (const s of segments) {
-    if (offset >= s.tweeStart && offset <= s.tweeStart + s.tweeLength) {
-      const delta = offset - s.tweeStart;
-      if (s.tsLength === s.tweeLength) return s.tsStart + delta;
-      // Rewritten: aim at the end of the emitted text, which is the member name
-      // (`State.variables.hp` <- `$hp`), so hover lands on the property.
-      return s.tsStart + s.tsLength;
-    }
-  }
-  return null;
+  const s = findSegment(segments, offset, "twee", false);
+  if (!s) return null;
+  if (s.tsLength === s.tweeLength) return s.tsStart + (offset - s.tweeStart);
+  // Rewritten: aim at the end of the emitted text, which is the member name
+  // (`State.variables.hp` <- `$hp`), so hover lands on the property.
+  return s.tsStart + s.tsLength;
 }
 
-// Map a TS range back to a twee range, for diagnostics.
+// Map a TS range back to a twee range, for diagnostics and hover spans.
 function tsRangeToTwee(segments, start, length) {
   const from = tsOffsetToTwee(segments, start);
   if (from === null) return null;
-  const toRaw = tsOffsetToTwee(segments, start + length);
-  const to = toRaw === null || toRaw <= from ? from + length : toRaw;
+  let to = tsOffsetToTweeEnd(segments, start + length);
+  if (to === null || to <= from) {
+    // The range ends in scaffolding that has no source counterpart. Clamp to the
+    // source span of the segment it starts in: a twee length is never allowed to
+    // come from a TypeScript length, or the highlight runs past the token into
+    // whatever the author wrote next.
+    const s = findSegment(segments, start, "ts", false);
+    const limit = s ? s.tweeStart + s.tweeLength : from + length;
+    to = Math.min(from + length, limit);
+  }
   return { start: from, length: Math.max(1, to - from) };
 }
 
