@@ -192,6 +192,62 @@ eq("a stray << plus a later apostrophe doesn't kill the rest of the file",
     range ? JSON.stringify(src.slice(range.start, range.start + range.length)) : "(no range)");
 }
 
+// --- ranges inside a rewritten sigil ---
+// A rewritten segment has no per-character correspondence, so a TS range that
+// begins and ends inside one has to map to the WHOLE source token. Taking the
+// TypeScript length instead (`State.variables.hp` is 15 characters longer than
+// `$hp`) made hovers stop short of the last character and diagnostics spill past
+// the variable into the author's next words.
+{
+  const src = `<<set $fakePassage to "This is a fake passage.">>`;
+  const { ts, segments } = project(src);
+  const at = (needle, text) => {
+    const start = ts.indexOf(needle);
+    const r = tsRangeToTwee(segments, start, (text || needle).length);
+    return r ? src.slice(r.start, r.start + r.length) : "(no range)";
+  };
+  // The member name alone — what quickinfo returns for a hover.
+  eq("a hover span inside a sigil covers the whole sigil",
+    at("fakePassage"), "$fakePassage");
+  // The whole rewritten expression — what a diagnostic on the variable returns.
+  eq("a diagnostic on the rewritten name covers the whole sigil",
+    at("State.variables.fakePassage"), "$fakePassage");
+}
+{
+  // `$test3` is possibly undefined: TS reports the range `State.variables.test3`,
+  // 21 characters, which used to underline `$test3.property = "Th`.
+  const src = `<<set $test3.property = "This is a test variable.">>`;
+  const { ts, segments } = project(src);
+  const start = ts.indexOf("State.variables.test3");
+  const r = tsRangeToTwee(segments, start, "State.variables.test3".length);
+  eq("a possibly-undefined diagnostic stops at the end of the sigil",
+    src.slice(r.start, r.start + r.length), "$test3");
+  // ...and a range that continues past the sigil still covers everything it spans.
+  const whole = tsRangeToTwee(segments, start, ts.indexOf('"') + 26 - start);
+  eq("a range spanning the sigil and the text after it covers both",
+    src.slice(whole.start, whole.start + whole.length),
+    `$test3.property = "This is a test variable."`);
+}
+{
+  // The same collapse in prose, where the emission ends the projection: the
+  // over-long range used to run off the end of the document.
+  const src = "The test variable is $test3.";
+  const { ts, segments } = project(src);
+  const start = ts.indexOf("State.variables.test3");
+  const r = tsRangeToTwee(segments, start, "State.variables.test3".length);
+  eq("a prose sigil's range stops at the sigil, not past the document",
+    src.slice(r.start, r.start + r.length), "$test3");
+}
+{
+  // Hovering the sigil character itself must reach the member, not the `State`
+  // that the preceding verbatim segment's boundary used to hand back.
+  const src = "<<set $hp to 1>>";
+  const { ts, segments } = project(src);
+  const tsOffset = tweeOffsetToTs(segments, src.indexOf("$hp"));
+  eq("hovering the $ itself lands on the member, not on State",
+    ts.slice(tsOffset - "State.variables.hp".length, tsOffset), "State.variables.hp");
+}
+
 // --- multi-line realism ---
 {
   const src = [
