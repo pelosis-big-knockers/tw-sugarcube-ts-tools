@@ -501,6 +501,63 @@ async function main() {
   });
   check("no language-service crash (Object.assign)", !assignRun.crashed, "Debug Failure seen");
 
+  // ---------- containers reached through a local alias ----------
+  // `const sv = State.variables; sv.hp = 100` is how a lot of story code is
+  // actually written. Nothing about `sv.hp` looks like a container member, so
+  // before aliases were followed the member had no type, no definition site, and
+  // — with typo detection on — was reported as nonexistent at the one place it
+  // is created. Typo detection is on here because it is what makes the negatives
+  // below observable at all.
+  console.log("\nlocal aliases (const sv = State.variables):");
+  const aliasFixture = path.join(testDir, "fixture-alias");
+  const aliasWorld = toPosix(path.join(aliasFixture, "world.ts"));
+  const aliasUse = toPosix(path.join(aliasFixture, "use.ts"));
+  const aliasMisuse = toPosix(path.join(aliasFixture, "misuse.ts"));
+  const aliasWorldContent = readFileSync(path.join(aliasFixture, "world.ts"), "utf8");
+  const aliasUseContent = readFileSync(path.join(aliasFixture, "use.ts"), "utf8");
+  const aliasRun = await withServer(aliasFixture, async ({ proj, send, wait, diagnostics, lastOf }) => {
+    send("configurePlugin", { pluginName: "tw-sugarcube-ts-plugin", configuration: { strict: true, typoDetection: true } });
+    send("open", { file: aliasWorld, projectRootPath: proj });
+    send("open", { file: aliasUse, projectRootPath: proj });
+    send("open", { file: aliasMisuse, projectRootPath: proj });
+    await wait(3000);
+
+    send("semanticDiagnosticsSync", { file: aliasWorld });
+    await wait(1600);
+    const world = diagnostics();
+    check("assigning through an alias is not itself an error", world.length === 0, world.join(" | "));
+
+    send("semanticDiagnosticsSync", { file: aliasUse });
+    await wait(1600);
+    const use = diagnostics();
+    check("members created through an alias exist on the container",
+      use.length === 0, use.join(" | "));
+
+    // Without this, "clean file" above would pass just as well with `name`/`hp`
+    // left `any` by the index signature.
+    send("semanticDiagnosticsSync", { file: aliasMisuse });
+    await wait(1600);
+    const bad = diagnostics();
+    check("an alias-derived type is enforced, not just present",
+      bad.some((d) => /Type 'number' is not assignable to type 'string'/.test(d)),
+      bad.join(" | ") || "(no diagnostics — hp is still `any`)");
+    check("a binding that only shares the alias's name is not the container",
+      bad.some((d) => /Property 'fromShadow' does not exist/.test(d)), bad.join(" | "));
+    check("a `let` is not an alias (it can be re-pointed)",
+      bad.some((d) => /Property 'fromLet' does not exist/.test(d)), bad.join(" | "));
+    check("nothing else is reported", bad.length === 3, bad.join(" | "));
+
+    // Go-to-definition must land on `sv.name = "Hero"`, the real creation site.
+    const atName = positionOf(aliasUseContent, "variables.name");
+    send("definitionAndBoundSpan", { file: aliasUse, line: atName.line, offset: atName.offset + "variables.".length });
+    await wait(900);
+    const def = lastOf("definitionAndBoundSpan")?.body?.definitions?.[0];
+    check("go-to-definition lands on the assignment made through the alias",
+      !!def && /world\.ts$/i.test(def.file) && def.start.line === positionOf(aliasWorldContent, 'sv.name = "Hero"').line,
+      def ? `${def.file}:${def.start.line}` : "(no definition)");
+  });
+  check("no language-service crash (aliases)", !aliasRun.crashed, "Debug Failure seen");
+
   // Default-off: the same fixture must be silent without the setting.
   const typoOffRun = await withServer(typoFixture, async ({ proj, send, wait, diagnostics }) => {
     send("open", { file: typoUse, projectRootPath: proj });

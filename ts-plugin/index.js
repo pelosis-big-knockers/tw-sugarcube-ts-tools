@@ -260,13 +260,18 @@ function init(modules) {
 
   const { interfaceFor } = analyzer;
 
-  function memberAt(sourceFile, position) {
+  // `checker` only powers alias resolution (`const sv = State.variables`), so
+  // both walks below degrade to the plain syntactic match without one. The
+  // position test comes first in both: it rules out all but one node, and
+  // resolving an alias costs a symbol lookup.
+  function memberAt(sourceFile, position, checker) {
     let found = null;
     const visit = (node) => {
       if (found) return;
-      if (ts.isPropertyAccessExpression(node)) {
-        const iface = interfaceFor(node.expression);
-        if (iface && position >= node.name.getStart(sourceFile) && position <= node.name.getEnd()) {
+      if (ts.isPropertyAccessExpression(node) &&
+          position >= node.name.getStart(sourceFile) && position <= node.name.getEnd()) {
+        const iface = interfaceFor(node.expression, checker);
+        if (iface) {
           found = { iface, name: node.name.text, node: node.name };
           return;
         }
@@ -277,13 +282,14 @@ function init(modules) {
     return found;
   }
 
-  function containerBeforeDot(sourceFile, position) {
+  function containerBeforeDot(sourceFile, position, checker) {
     let hit = null;
     const visit = (node) => {
       if (hit) return;
-      if (ts.isPropertyAccessExpression(node)) {
-        const iface = interfaceFor(node.expression);
-        if (iface && position >= node.expression.getEnd() && position <= node.getEnd()) { hit = iface; return; }
+      if (ts.isPropertyAccessExpression(node) &&
+          position >= node.expression.getEnd() && position <= node.getEnd()) {
+        const iface = interfaceFor(node.expression, checker);
+        if (iface) { hit = iface; return; }
       }
       ts.forEachChild(node, visit);
     };
@@ -514,9 +520,10 @@ function init(modules) {
       const program = ls.getProgram();
       const sf = program && program.getSourceFile(fileName);
       if (!sf) return prior;
+      const checker = program.getTypeChecker();
       return prior.filter((d) => {
         if (!PROPERTY_MISSING.has(d.code) || typeof d.start !== "number") return true;
-        return !memberAt(sf, d.start);
+        return !memberAt(sf, d.start, checker);
       });
     };
 
@@ -530,7 +537,7 @@ function init(modules) {
       const prior = ls.getCompletionsAtPosition(fileName, position, options, settings);
       const program = ls.getProgram();
       const sf = program && program.getSourceFile(fileName);
-      const iface = sf && containerBeforeDot(sf, position);
+      const iface = sf && containerBeforeDot(sf, position, program.getTypeChecker());
       if (!iface) return prior;
 
       // Generated members complete natively; this only fills in for containers
@@ -549,7 +556,7 @@ function init(modules) {
       refresh();
       const program = ls.getProgram();
       const sf = program && program.getSourceFile(fileName);
-      const member = sf && memberAt(sf, position);
+      const member = sf && memberAt(sf, position, program.getTypeChecker());
       if (!member) return ls.getDefinitionAndBoundSpan(fileName, position);
 
       const entry = scanSites(program).get(member.iface);

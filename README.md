@@ -38,6 +38,22 @@ project. TypeScript then types those members natively, so you get:
 Because the members are genuinely declared, `keyof typeof setup` is meaningful —
 useful for dynamic access: `const k: keyof typeof setup = "attack"; setup[k] = …`.
 
+A container shortened into a local counts as the container itself, so the common
+shorthand is understood:
+
+```ts
+setup.setupPlayer = () => {
+  const sv = State.variables;
+  sv.name = "Hero";   // same as State.variables.name = "Hero"
+  sv.hp = 100;
+};
+```
+
+The alias must be `const` (a `let` can be pointed at a different object further
+down, and its members would then be filed under the container by mistake).
+Aliases chain, may be `export`ed from a shared module, and a nested binding that
+happens to reuse the name correctly shadows the alias.
+
 You need **no `.d.ts` in your project**. Engine globals (`State`, `Story`, `$`,
 `Config`, …) come from [`@types/twine-sugarcube`](https://www.npmjs.com/package/@types/twine-sugarcube);
 load them with `"types": ["twine-sugarcube"]` in your `tsconfig.json`.

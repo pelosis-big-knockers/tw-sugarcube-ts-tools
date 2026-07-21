@@ -2,7 +2,7 @@
   "name": "tw-sugarcube-ts-tools",
   "displayName": "Twine SugarCube TypeScript Tools",
   "description": "Editor intelligence for SugarCube in TypeScript/JavaScript: real types on hover, parameter and return-type checking, completion, and go-to-definition for members of setup, State.variables, State.temporary, and settings.",
-  "version": "0.9.1",
+  "version": "0.10.0",
   "publisher": "pelosis-big-knockers",
   "private": true,
   "license": "GPL-3.0-or-later",

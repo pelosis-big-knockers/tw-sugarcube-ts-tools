@@ -70,11 +70,49 @@ function createAnalyzer(ts) {
   const isDotted = (n, obj, prop) =>
     ts.isPropertyAccessExpression(n) && isIdent(n.expression, obj) && n.name.text === prop;
 
-  function interfaceFor(objExpr) {
+  function namedContainer(objExpr) {
     if (isIdent(objExpr, "setup")) return "SugarCubeSetupObject";
     if (isIdent(objExpr, "settings")) return "SugarCubeSettingVariables";
     if (isDotted(objExpr, "State", "variables")) return "SugarCubeStoryVariables";
     if (isDotted(objExpr, "State", "temporary")) return "SugarCubeTemporaryVariables";
+    return null;
+  }
+
+  // Authors routinely shorten a container into a local before writing to it:
+  //
+  //   const sv = State.variables;
+  //   sv.name = "Hero";
+  //
+  // Syntactically `sv.name` looks like nothing at all, so without following the
+  // alias the member gets no type and no definition site — and with typo
+  // detection it is reported as nonexistent at the very place it is created.
+  //
+  // Only `const` counts: a `let` can be pointed at some other object further
+  // down, and we would then file that object's members under the container.
+  // Resolution goes through the symbol rather than the name, so a nested binding
+  // that shadows the alias correctly stops resolving, and an alias exported from
+  // a shared module still resolves through the import.
+  const MAX_ALIAS_HOPS = 8; // `const a = sv` chains; also breaks `const a = a`
+
+  function aliasInitializer(checker, node) {
+    if (!checker || !ts.isIdentifier(node)) return null;
+    let symbol = checker.getSymbolAtLocation(node);
+    if (symbol && symbol.flags & ts.SymbolFlags.Alias) symbol = checker.getAliasedSymbol(symbol);
+    const decl = symbol && symbol.valueDeclaration;
+    if (!decl || !ts.isVariableDeclaration(decl) || !decl.initializer) return null;
+    if (!(ts.getCombinedNodeFlags(decl) & ts.NodeFlags.Const)) return null;
+    return decl.initializer;
+  }
+
+  // `checker` is optional: without one this stays the purely syntactic test it
+  // has always been, and aliases simply don't resolve.
+  function interfaceFor(objExpr, checker) {
+    let node = objExpr;
+    for (let hops = 0; node && hops <= MAX_ALIAS_HOPS; hops++) {
+      const direct = namedContainer(node);
+      if (direct) return direct;
+      node = aliasInitializer(checker, node);
+    }
     return null;
   }
 
@@ -114,6 +152,10 @@ function createAnalyzer(ts) {
     };
     const skip = skipFile ? norm(skipFile) : null;
     const byPath = projections || new Map();
+    // Aliases resolve through symbols, not types, so they are available even on
+    // the site-only walk that deliberately passes no checker. The Program caches
+    // this instance, and generation already asks for it.
+    const resolver = checker || program.getTypeChecker();
 
     for (const sf of program.getSourceFiles()) {
       if (sf.isDeclarationFile || /[\\/]node_modules[\\/]/.test(sf.fileName)) continue;
@@ -128,7 +170,7 @@ function createAnalyzer(ts) {
         // container has to stay open or every one of them reads as a typo.
         if (ts.isCallExpression(node) && isDotted(node.expression, "Object", "assign")) {
           const target = node.arguments && node.arguments[0];
-          const iface = target && interfaceFor(target);
+          const iface = target && interfaceFor(target, resolver);
           if (iface) entryFor(iface).dynamic = true;
         }
         if (ts.isBinaryExpression(node)) {
@@ -145,7 +187,7 @@ function createAnalyzer(ts) {
               if (arg && ts.isStringLiteralLike(arg)) { name = arg.text; nameNode = arg; }
               else dynamic = true;
             }
-            const iface = objExpr && interfaceFor(objExpr);
+            const iface = objExpr && interfaceFor(objExpr, resolver);
             if (iface) {
               const entry = entryFor(iface);
               if (dynamic) entry.dynamic = true;
