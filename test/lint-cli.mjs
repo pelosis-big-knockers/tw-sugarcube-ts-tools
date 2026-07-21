@@ -90,6 +90,21 @@ console.log("lint CLI\n");
     !/did not settle/.test(r.err), r.err);
 }
 
+// --- <<script>> payloads are analyzed as the code they are ------------------
+// A payload used to be read as prose, so its `_locals` became bogus
+// `State.temporary` reads, its real statements were never projected, and this
+// whole fixture linted clean: the type error inside the payload was invisible
+// and the variable the payload creates was never recovered.
+{
+  const r = lint("fixture-lint-script", ["--typos"]);
+  check("a type error inside a <<script>> payload is reported at its .twee line",
+    /story\.twee:9:14\s+error\s+TS2345/.test(r.out), r.out);
+  check("a variable created only by a <<script>> payload gets its type",
+    /world\.ts:6:\d+\s+error\s+TS2322.*'number' is not assignable to type 'string'/.test(r.out), r.out);
+  check("...and the payload's own locals are not mistaken for story variables",
+    /2 problems/.test(r.out), r.out);
+}
+
 // --- typo detection is opt-in ----------------------------------------------
 {
   const off = lint("fixture-typos");

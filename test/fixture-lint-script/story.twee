@@ -1,0 +1,14 @@
+:: Start
+<<script>>
+let _count = 0;
+const $node = 1;
+for (let _i = 0; _i < 3; _i++) {
+  _count += _i + $node;
+}
+State.variables.gold = _count;
+setup.attack("bad");
+<</script>>
+
+:: Shop
+<<set _turn to 1>>
+<<run setup.attack($gold)>>

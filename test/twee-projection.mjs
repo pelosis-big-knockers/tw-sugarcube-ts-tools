@@ -146,6 +146,63 @@ check("unknown macros are skipped entirely",
 check("an unterminated macro does not throw or emit garbage",
   flat("<<run setup.foo(") === "", JSON.stringify(project("<<run setup.foo(").ts));
 
+// --- <<script>> payloads are code, not markup --------------------------------
+// SugarCube evals a `<<script>>` payload as plain JavaScript, so none of the
+// TwineScript sugar applies to it: `_i` is a local variable and `$el` is an
+// ordinary identifier. Projecting the payload as prose (what happened before it
+// was recognized) invented a `State.temporary.i` member the story never had.
+const script = (body) => `(function (this: any) { ${body} });`;
+eq("a <<script>> payload is projected as code",
+  flat("<<script>>\nsetup.boot();\n<</script>>"), script("setup.boot();"));
+eq("_locals in a <<script>> are not State.temporary",
+  flat("<<script>>\nlet _i = 0;\n_i++;\n<</script>>"), script("let _i = 0; _i++;"));
+eq("$identifiers in a <<script>> are not State.variables",
+  flat("<<script>>\nconst $el = $(\"#x\");\n<</script>>"), script('const $el = $("#x");'));
+eq("word operators in a <<script>> are left alone",
+  flat("<<script>>\nconst to = a is b;\n<</script>>"), script("const to = a is b;"));
+eq("an explicit JavaScript argument reads the same as no argument",
+  flat("<<script JavaScript>>\nlet _i = 0;\n<</script>>"), script("let _i = 0;"));
+// TypeScript in a payload is projected as written — tw-server strips the types
+// before tweego ever sees the file.
+eq("TypeScript in a <<script>> payload survives",
+  flat("<<script>>\nconst n: number = setup.hit(1);\n<</script>>"),
+  script("const n: number = setup.hit(1);"));
+// ...but `<<script TwineScript>>` routes through evalTwineScript, which DOES
+// desugar, so that one keeps the sigil rewriting.
+eq("<<script TwineScript>> is desugared",
+  flat("<<script TwineScript>>\n$hp to 10;\n<</script>>"),
+  script("State.variables.hp = 10;"));
+// The payload is code, so a `<<` in it is a shift and its `<</script>>` is not a
+// stray closing tag — neither may derail the scan of the rest of the file.
+eq("a << inside a payload does not open a macro",
+  flat("<<script>>\nif (a << b) { f(); }\n<</script>><<set $x to 1>>"),
+  `${script("if (a << b) { f(); }")} State.variables.x = 1 ;`);
+eq("<<endscript>> closes a payload too",
+  flat("<<script>>\nf();\n<<endscript>>"), script("f();"));
+// Half-written payloads: the projection has to survive them, because that is the
+// normal state of a file being typed into.
+eq("an unbalanced payload is skipped, and the rest of the file still projects",
+  flat("<<script>>\nlet broken = {\n<</script>><<set $x to 1>>"),
+  "State.variables.x = 1 ;");
+eq("an unterminated string in a payload is skipped too",
+  flat("<<script>>\nf('oops\n<</script>><<set $x to 1>>"), "State.variables.x = 1 ;");
+eq("an unterminated block comment in a payload is skipped too",
+  flat("<<script>>\n/* oops\n<</script>><<set $x to 1>>"), "State.variables.x = 1 ;");
+check("an unclosed <<script>> does not swallow the next passage",
+  /State\.variables\.y = 2/.test(project(":: A\n<<script>>\nlet x = 1;\n:: B\n<<set $y to 2>>\n").ts),
+  JSON.stringify(project(":: A\n<<script>>\nlet x = 1;\n:: B\n<<set $y to 2>>\n").ts));
+eq("an empty payload emits nothing", flat("<<script>>\n\n<</script>>"), "");
+// A payload is verbatim, so its spans map back character-for-character.
+{
+  const src = ':: Start\n<<script>>\nsetup.attack("nope");\n<</script>>\n';
+  const { ts, segments } = project(src);
+  const at = ts.indexOf('"nope"');
+  const range = tsRangeToTwee(segments, at, '"nope"'.length);
+  check("a diagnostic inside a payload maps onto the offending source",
+    !!range && src.slice(range.start, range.start + range.length) === '"nope"',
+    range ? JSON.stringify(src.slice(range.start, range.start + range.length)) : "(no range)");
+}
+
 // --- prose variables ---
 eq("naked $var in prose is projected",
   flat("You have $gold coins."), "State.variables.gold;");
@@ -200,9 +257,27 @@ eq("a >> inside a block comment does not close the macro early",
     "<<unless $a>><</if>>", "<<if>><</if>>", "<<if $a>><<elseif>><</if>>",
     ":: A\n<<if $a>>\n:: B\n<</if>>", ":: A\n<<if $a>><</if>>\n:: B\n<<else>>",
     "<<if $a // c>><<run f()>><</if>>", "<<if $a>>text $b more<</if>>",
+    // A `<<script>>` payload is emitted verbatim, so every half-written shape of
+    // one has to leave the projection parseable too.
+    "<<script>>", "<</script>>", "<<script>>f();", "<<script>>let x = {<</script>>",
+    "<<script>>}<</script>>", "<<script>>f('<</script>>", "<<script>>/*<</script>>",
+    "<<if $a>><<script>>f();<</script>><</if>>",
   ]) {
     check(`malformed block markup still parses: ${JSON.stringify(src)}`,
       parsesClean(src), JSON.stringify(project(src).ts));
+  }
+  // A payload that balances its brackets but isn't valid JavaScript reports the
+  // author's own syntax error, which is correct — what it must not do is cost
+  // the file its structure. The passage block still closes and the macro after
+  // it is still a statement of that block.
+  {
+    const src = "<<script>>\n<<if $a>>\n<</script>>\n<<set $x to 1>>";
+    const sf = ts.createSourceFile("p.ts", project(src).ts, ts.ScriptTarget.Latest, true);
+    const body = sf.statements[0]?.thenStatement?.statements ?? [];
+    check("a payload that isn't valid JS keeps the file's structure",
+      sf.statements.length === 1 && body.length >= 2 &&
+        /State\.variables\.x = 1/.test(project(src).ts),
+      JSON.stringify(project(src).ts));
   }
   check("a trailing // comment in <<run>> still projects to valid TS",
     parsesClean("<<run f($hp) // note>>"), JSON.stringify(project("<<run f($hp) // note>>").ts));
