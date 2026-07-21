@@ -26,7 +26,20 @@ console.log("twee projection\n");
 // The scaffolding that terminates each emission (`;`, `) {}`) starts on its own
 // line so a trailing `//` comment in the author's code can't swallow it; these
 // helpers compare the projection with that layout noise collapsed.
-const flat = (src) => project(src).ts.trim().replace(/\s+/g, " ");
+//
+// Each passage body is also wrapped in an opaque `if` block, so one passage's
+// assignments can't narrow what the next one reads. These sources are single
+// passages and are about what the macros project to, so the wrapper is stripped
+// along with the layout noise; `PASSAGE_BLOCK` covers it directly.
+const PASSAGE_OPEN = "if (0 as any) {";
+const flat = (src) => {
+  const ts = project(src).ts.trim().replace(/\s+/g, " ");
+  if (ts === `${PASSAGE_OPEN} }`) return "";
+  if (ts.startsWith(`${PASSAGE_OPEN} `) && ts.endsWith(" }")) {
+    return ts.slice(PASSAGE_OPEN.length + 1, -2);
+  }
+  return ts;
+};
 
 // --- macro bodies become statements ---
 eq("<<run>> projects its expression",
@@ -47,6 +60,63 @@ eq("<<set $hp = 10>> also works",
   flat("<<set $hp = 10>>"), "State.variables.hp = 10 ;");
 eq("<<if>> becomes a condition",
   flat("<<if $hp gt 0>>"), "if ( State.variables.hp > 0 ) {}");
+
+// --- conditional blocks -----------------------------------------------------
+// A closed `<<if>>` guards a real TypeScript block, which is what makes the
+// condition narrow the code inside it: `<<if $hp>>` means `$hp` is not null
+// until the `<<else>>` / `<</if>>`.
+eq("a closed <<if>> guards its body",
+  flat("<<if $hp>><<run setup.hit($hp)>><</if>>"),
+  "if ( State.variables.hp ) { setup.hit(State.variables.hp) ; }");
+eq("<<elseif>> and <<else>> continue the chain",
+  flat("<<if $a>><<run f()>><<elseif $b>><<run g()>><<else>><<run h()>><</if>>"),
+  "if ( State.variables.a ) { f() ; } else if ( State.variables.b ) { g() ; } else { h() ; }");
+eq("the <<endif>> spelling closes a block too",
+  flat("<<if $a>><<run f()>><<endif>>"), "if ( State.variables.a ) { f() ; }");
+eq("<<if>> blocks nest",
+  flat("<<if $a>><<if $b>><<run f()>><</if>><</if>>"),
+  "if ( State.variables.a ) { if ( State.variables.b ) { f() ; } }");
+eq("<<unless>> guards the negated condition",
+  flat("<<unless $a>><<run f()>><</unless>>"),
+  "if (!( State.variables.a )) { f() ; }");
+// Prose between the macros is part of the guarded body, so a naked sigil there
+// is narrowed like everything else.
+eq("prose inside a block stays inside it",
+  flat("<<if $hp>>You have $hp left.<</if>>"),
+  "if ( State.variables.hp ) { State.variables.hp; }");
+// An empty condition is a SugarCube error, but the block still has to balance.
+eq("an empty condition still opens a block",
+  flat("<<if>><<run f()>><</if>>"), "if (0 as any ) { f() ; }");
+
+// A block that isn't complete and properly nested keeps the old self-contained
+// emission. An unbalanced brace would be a syntax error across the WHOLE
+// projection, and a half-written chain is the normal state of a file being
+// typed into.
+eq("an unclosed <<if>> falls back to a self-contained condition",
+  flat("<<if $a>><<run f()>>"), "if ( State.variables.a ) {} f() ;");
+eq("a stray <</if>> emits nothing",
+  flat("<<run f()>><</if>>"), "f() ;");
+eq("a stray <<else>> emits nothing",
+  flat("<<run f()>><<else>><<run g()>>"), "f() ; g() ;");
+// Crossed markup: the `<</if>>` pairs with the `<<if>>`, and the `<<unless>>`
+// it skipped past falls back rather than being closed by the wrong tag.
+eq("crossed close tags fall back instead of pairing wrongly",
+  flat("<<if $a>><<unless $b>><<run f()>><</if>>"),
+  "if ( State.variables.a ) { if (!( State.variables.b )) {} f() ; }");
+
+// Passages are separate blocks, so a chain can never span them: the `<</if>>`
+// below belongs to no `<<if>>` at all.
+{
+  const ts = project(":: A\n<<if $a>>\n:: B\n<<run f()>>\n<</if>>\n").ts;
+  check("a block never spans a passage header",
+    /if \( State\.variables\.a\s*\) \{\}/.test(ts) && !/\} else/.test(ts), JSON.stringify(ts));
+  const two = project(":: A\n<<set $hp to 1>>\n:: B\n<<run f($hp)>>\n").ts;
+  // Each passage gets its own block, so an assignment in one can't narrow what
+  // the next one reads (`<<set $item to null>>` in an init passage would
+  // otherwise make every later `<<if $item>>` narrow to `never`).
+  check("each passage is projected into its own block",
+    (two.match(/if \(0 as any\) \{/g) || []).length === 2, JSON.stringify(two));
+}
 
 // SugarCube's word operators are not valid TypeScript; leaving them alone would
 // report a syntax error on a perfectly good passage.
@@ -71,29 +141,29 @@ eq("'to' inside a string is left alone",
 eq("a member named 'to' is not rewritten",
   flat("<<run setup.to()>>"), "setup.to() ;");
 check("unknown macros are skipped entirely",
-  project("<<linkreplace 'Go'>><<mycustom arg>>").ts.trim() === "",
+  flat("<<linkreplace 'Go'>><<mycustom arg>>") === "",
   JSON.stringify(project("<<linkreplace 'Go'>><<mycustom arg>>").ts));
 check("an unterminated macro does not throw or emit garbage",
-  project("<<run setup.foo(").ts.trim() === "", JSON.stringify(project("<<run setup.foo(").ts));
+  flat("<<run setup.foo(") === "", JSON.stringify(project("<<run setup.foo(").ts));
 
 // --- prose variables ---
 eq("naked $var in prose is projected",
-  project("You have $gold coins.").ts.trim(), "State.variables.gold;");
+  flat("You have $gold coins."), "State.variables.gold;");
 eq("dotted prose variable is projected",
-  project("Hello $player.name!").ts.trim(), "State.variables.player.name;");
-check("a bare $ is not projected", project("Costs $ 5").ts.trim() === "", "bare $ leaked");
+  flat("Hello $player.name!"), "State.variables.player.name;");
+check("a bare $ is not projected", flat("Costs $ 5") === "", "bare $ leaked");
 
 // SugarCube interpolates temporary (`_`) variables in prose too.
 eq("naked _temp in prose is projected",
-  project("Rolled _scratch this turn.").ts.trim(), "State.temporary.scratch;");
+  flat("Rolled _scratch this turn."), "State.temporary.scratch;");
 eq("dotted prose temp variable is projected",
-  project("Name is _hero.name.").ts.trim(), "State.temporary.hero.name;");
+  flat("Name is _hero.name."), "State.temporary.hero.name;");
 // ...but ordinary text with underscores must not be mistaken for a variable.
 check("a mid-word underscore (snake_case) is not projected",
-  project("please call do_thing now").ts.trim() === "", "snake_case leaked");
+  flat("please call do_thing now") === "", "snake_case leaked");
 check("double-underscore markup (__underline__) is not projected",
-  project("this is __important__ text").ts.trim() === "", "__markup__ leaked");
-check("a bare _ is not projected", project("a _ b").ts.trim() === "", "bare _ leaked");
+  flat("this is __important__ text") === "", "__markup__ leaked");
+check("a bare _ is not projected", flat("a _ b") === "", "bare _ leaked");
 
 // --- comments are inert ---
 // A sigil or word operator inside a comment is the author's note, not code, so it
@@ -118,15 +188,34 @@ eq("a >> inside a block comment does not close the macro early",
   };
   check("a trailing // comment in <<if>> still projects to valid TS",
     parsesClean("<<if $hp gt 0 // sanity check>>"), JSON.stringify(project("<<if $hp gt 0 // sanity check>>").ts));
+  // Blocks are the one construct that can leave a brace open, and an unbalanced
+  // brace is a syntax error over the WHOLE projection — which would bury every
+  // real diagnostic in the file. Half-written and crossed markup is the normal
+  // state of a file being typed into, so each shape has to stay parseable.
+  for (const src of [
+    "<<if $a>>", "<</if>>", "<<else>>", "<<elseif $a>>", "<<endif>>",
+    "<<if $a>><<else>>", "<<if $a>><<else>><<else>><</if>>",
+    "<<if $a>><</if>><</if>>", "<<if $a>><<if $b>><</if>>",
+    "<<if $a>><<unless $b>><</if>><</unless>>",
+    "<<unless $a>><</if>>", "<<if>><</if>>", "<<if $a>><<elseif>><</if>>",
+    ":: A\n<<if $a>>\n:: B\n<</if>>", ":: A\n<<if $a>><</if>>\n:: B\n<<else>>",
+    "<<if $a // c>><<run f()>><</if>>", "<<if $a>>text $b more<</if>>",
+  ]) {
+    check(`malformed block markup still parses: ${JSON.stringify(src)}`,
+      parsesClean(src), JSON.stringify(project(src).ts));
+  }
   check("a trailing // comment in <<run>> still projects to valid TS",
     parsesClean("<<run f($hp) // note>>"), JSON.stringify(project("<<run f($hp) // note>>").ts));
   // ASI hazard: without the newline'd `;`, `$a // note` followed by `($b + 1)`
   // parsed as a CALL of $a — a bogus "not callable" diagnostic on valid code.
   const asi = project("<<print $a // note>> <<print ($b + 1)>>").ts;
   const sf = ts.createSourceFile("p.ts", asi, ts.ScriptTarget.Latest, true);
+  // Both emissions live in the passage block, so the count to make is of the
+  // statements inside it.
+  const body = sf.statements[0]?.thenStatement?.statements ?? [];
   check("a comment before a parenthesized statement does not merge them (ASI)",
-    sf.statements.length === 2 && (sf.parseDiagnostics || []).length === 0,
-    `${sf.statements.length} statement(s) in ${JSON.stringify(asi)}`);
+    body.length === 2 && (sf.parseDiagnostics || []).length === 0,
+    `${body.length} statement(s) in ${JSON.stringify(asi)}`);
 }
 
 // --- template literals ---
@@ -262,7 +351,8 @@ eq("a stray << plus a later apostrophe doesn't kill the rest of the file",
   const { ts, segments } = project(src);
   // <<set>>, the prose $hp, and the two <<= >> calls — with each macro's `;`
   // scaffolding on its own line (prose emissions keep theirs inline).
-  const statements = ts.trim().split("\n").filter((l) => l.trim() && l.trim() !== ";");
+  const statements = ts.trim().split("\n")
+    .filter((l) => l.trim() && l.trim() !== ";" && l.trim() !== "}" && l.trim() !== PASSAGE_OPEN);
   eq("a realistic passage projects every JS site", statements.length, 4);
   check("title/prose text is not projected as code",
     !/StoryTitle|Spike|health/.test(ts), ts);
