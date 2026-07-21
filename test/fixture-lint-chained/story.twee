@@ -1,0 +1,6 @@
+:: StoryTitle
+Chained Recovery Fixture
+
+:: Start
+<<set $hero to setup.makeHero()>>
+<<set $hero.hp to "lots">>
