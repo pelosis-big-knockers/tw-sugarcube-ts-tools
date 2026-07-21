@@ -58,6 +58,30 @@ const OPAQUE_CONDITION = "0 as any";
 const PASSAGE_OPEN = `if (${OPAQUE_CONDITION}) {\n`;
 const PASSAGE_CLOSE = "\n}\n";
 
+// `<<script>>` is the one macro whose payload is code rather than markup.
+// SugarCube hands it straight to `Scripting.evalJavaScript`, which `eval`s it
+// inside a function whose `this` is `{ output }` — so NOTHING in it is
+// desugared: `_i` is a local variable, not `State.temporary.i`, and `to` is
+// just a word. Projecting the body as prose (which is what happens when the
+// macro isn't recognized) invents `State.temporary.*` members that the story
+// never had. The one exception is `<<script TwineScript>>`, which routes
+// through `evalTwineScript` and IS desugared.
+//
+// The body becomes a function expression of its own so it gets the scope
+// isolation it has at runtime — two blocks may each declare `const x` — and so
+// `this.output` doesn't read as `globalThis`. `this: any` rather than a real
+// shape: the projection must never be the source of a diagnostic the author
+// can't act on, and typing `output` would need the DOM lib to be loaded.
+const SCRIPT_OPEN = "(function (this: any) {\n";
+const SCRIPT_CLOSE = "\n});\n";
+
+// `<<script>>`, optionally with the language argument SugarCube accepts.
+const SCRIPT_OPEN_RE = /^\s*script(?![A-Za-z0-9_])/;
+// SugarCube closes a container macro with either spelling.
+const SCRIPT_CLOSE_RE = /<<\s*(?:\/script|endscript)\s*>>/;
+// A passage header ends the passage's text, so it also ends an unclosed payload.
+const PASSAGE_HEADER_RE = /(^|\n)::/;
+
 class Builder {
   constructor() {
     this.ts = "";
@@ -214,6 +238,72 @@ function findSubstitutionEnd(text, from) {
   return k;
 }
 
+// Skip a quoted string (or a template literal) that starts at `i`, returning the
+// offset just past its closing quote, or -1 when it never closes.
+function skipQuoted(text, i) {
+  const quote = text[i];
+  let j = i + 1;
+  while (j < text.length) {
+    if (text[j] === "\\") { j += 2; continue; }
+    if (text[j] === quote) return j + 1;
+    j++;
+  }
+  return -1;
+}
+
+// Whether a body is self-contained: brackets paired, and no string or comment
+// left hanging open. A `<<script>>` payload is emitted verbatim, so a body that
+// isn't would eat the scaffolding that closes the passage block — turning one
+// half-typed script into a syntax error over the WHOLE projection and burying
+// every real diagnostic in the file.
+//
+// Deliberately cheap and biased toward "no": a regex literal is read as code,
+// so `/}/` reports unbalanced and the body is skipped. Losing diagnostics on
+// one script block is recoverable; losing them on the file is not.
+function isSelfContained(code) {
+  const CLOSERS = { ")": "(", "]": "[", "}": "{" };
+  const stack = [];
+  let i = 0;
+  while (i < code.length) {
+    const c = code[i];
+    if (c === '"' || c === "'" || c === "`") {
+      i = skipQuoted(code, i);
+      if (i === -1) return false;
+      continue;
+    }
+    if (c === "/" && code[i + 1] === "/") {
+      while (i < code.length && code[i] !== "\n") i++;
+      continue;
+    }
+    if (c === "/" && code[i + 1] === "*") {
+      const end = code.indexOf("*/", i + 2);
+      if (end === -1) return false;
+      i = end + 2;
+      continue;
+    }
+    if (c === "(" || c === "[" || c === "{") stack.push(c);
+    else if (CLOSERS[c] && stack.pop() !== CLOSERS[c]) return false;
+    i++;
+  }
+  return stack.length === 0;
+}
+
+// Project a `<<script>>` payload. `lang` is the macro's language argument,
+// lowercased; only `twinescript` desugars.
+function emitScriptPayload(builder, text, script, lang) {
+  const body = text.slice(script.bodyStart, script.bodyEnd);
+  if (!body.trim() || !isSelfContained(body)) return;
+  builder.raw(SCRIPT_OPEN);
+  if (lang === "twinescript") {
+    emitExpression(builder, body, script.bodyStart, { allowTo: true });
+  } else {
+    // Plain JavaScript (and TypeScript, which tw-server strips before tweego
+    // ever sees it) is already what the projection speaks — copy it through.
+    builder.verbatim(body, script.bodyStart);
+  }
+  builder.raw(SCRIPT_CLOSE);
+}
+
 // Find `<<...>>` macros. Quote-aware so `<<print "a>>b">>` closes correctly.
 function findMacros(text) {
   const out = [];
@@ -260,10 +350,31 @@ function findMacros(text) {
       i = open + 2;
       continue;
     }
-    out.push({ start: open, end: close + 2, inner: text.slice(open + 2, close) });
-    i = close + 2;
+    const macro = { start: open, end: close + 2, inner: text.slice(open + 2, close) };
+    // A `<<script>>` payload is code, not markup: a `<<` in it (`a << b`) is a
+    // shift, not a macro, and its `<</script>>` is not a stray closing tag. The
+    // whole region becomes one macro so everything inside is skipped at once.
+    const script = SCRIPT_OPEN_RE.test(macro.inner) ? findScriptPayload(text, macro.end) : null;
+    if (script) {
+      macro.script = script;
+      macro.end = script.end;
+    }
+    out.push(macro);
+    i = macro.end;
   }
   return out;
+}
+
+// Locate the payload of a `<<script>>` opened just before `from`. Returns null
+// when it isn't closed inside its own passage — an unclosed payload is the
+// normal state of a file being typed into, and swallowing the rest of the
+// document would drop every macro after it.
+function findScriptPayload(text, from) {
+  const rest = text.slice(from);
+  const match = SCRIPT_CLOSE_RE.exec(rest);
+  if (!match) return null;
+  if (PASSAGE_HEADER_RE.test(rest.slice(0, match.index))) return null;
+  return { bodyStart: from, bodyEnd: from + match.index, end: from + match.index + match[0].length };
 }
 
 // Split a macro body into its name and argument text, preserving offsets.
@@ -428,7 +539,9 @@ function project(text) {
     // The scaffolding that closes each emission starts on its own line: the
     // argument may end in a `//` comment, which would otherwise swallow the
     // `;` / `) {}` and leave the projection syntactically broken.
-    if (role === "close") {
+    if (macro.script) {
+      emitScriptPayload(builder, text, macro.script, arg.trim().toLowerCase());
+    } else if (role === "close") {
       builder.raw("\n}\n");
     } else if (role === "else") {
       builder.raw("\n} else {\n");

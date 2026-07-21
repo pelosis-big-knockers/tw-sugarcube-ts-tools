@@ -63,10 +63,49 @@ load them with `"types": ["twine-sugarcube"]` in your `tsconfig.json`.
 All four Twee source extensions tweego recognizes are covered. Inside passages you
 get hover, completion, go-to-definition, and diagnostics for
 `setup`/variable members in macro code — `<<= >>`, `<<print>>`, `<<run>>`,
-`<<set>>`, `<<if>>`, sigils (`$hp`, `_scratch`), and SugarCube's word operators
-(`gt`, `is`, `and`, …). A `<<set $hp to 10>>` types the variable everywhere,
+`<<set>>`, `<<if>>`, `<<script>>`, sigils (`$hp`, `_scratch`), and SugarCube's
+word operators (`gt`, `is`, `and`, …). A `<<set $hp to 10>>` types the variable everywhere,
 including in `.ts` files that read it. Passages update **live** — you don't have
 to save first; the unsaved buffer is pushed to the language service as you type.
+
+### `<<script>>` is code, not markup
+
+SugarCube hands a `<<script>>` payload straight to `eval`, so none of
+TwineScript's sugar applies inside it: `_i` is an ordinary local variable, `$el`
+is an ordinary identifier, and `to` is just a word. The payload is analyzed as
+what it is — real code, checked, with hover and go-to-definition, and with the
+members it assigns recovered like any other assignment:
+
+```
+:: Start
+<<script>>
+  let count = 0;
+  for (const hit of setup.rolls()) count += hit;
+  State.variables.gold = count;   <-- $gold is a number everywhere after this
+<</script>>
+```
+
+Payloads may be written in **TypeScript**. They're checked as TypeScript here,
+and [`tw-server`](https://github.com/pelosis-big-knockers/tw-server) strips the
+types out before tweego sees the file, exactly as it does for `.ts` sources —
+so annotations, `as`, `satisfies` and the rest are available in a passage:
+
+```
+<<script>>
+  const boost: number = setup.attack(2) satisfies number;
+  State.variables.hp += boost;
+<</script>>
+```
+
+Building with bare tweego instead would ship those types to the browser, where
+they are a syntax error — the type stripping is what makes them safe, so a
+TypeScript payload needs tw-server (or an equivalent step) in the build.
+
+`<<script TwineScript>>`, the one payload SugarCube *does* desugar, keeps the
+sigil rewriting. A payload that isn't closed, or whose brackets don't balance
+yet, is left alone until it is: half-written code is the normal state of a file
+being edited, and one unbalanced brace would otherwise report errors across the
+whole file.
 
 ### Narrowing in `<<if>>`
 
