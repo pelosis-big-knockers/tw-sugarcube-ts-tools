@@ -57,6 +57,23 @@ console.log("lint CLI\n");
   check("exit code is 0 when clean", r.code === 0, `exit ${r.code}: ${r.out}`);
 }
 
+// --- recovered types that depend on other recovered types ------------------
+// The linter used to generate the augmentation exactly once, from a program
+// where it was still empty. A member assigned from another recovered member
+// (`<<set $hero to setup.makeHero()>>`) therefore came back `any` and every
+// error downstream of it vanished — the extension squiggled, the linter passed.
+// Generation must iterate to a fixed point, as the plugin does.
+{
+  const r = lint("fixture-lint-chained");
+  check("a type recovered through another recovered type is resolved",
+    /not assignable to type 'number'/.test(r.out), r.out);
+  check("...and the finding maps to the .twee line that dereferences it",
+    /story\.twee:6:\d+/.test(r.out), r.out);
+  check("exit 1 on the chained-recovery finding", r.code === 1, `exit ${r.code}`);
+  check("generation settles (no non-convergence warning)",
+    !/did not settle/.test(r.err), r.err);
+}
+
 // --- typo detection is opt-in ----------------------------------------------
 {
   const off = lint("fixture-typos");

@@ -17,6 +17,11 @@ const path = require("path");
 const { createAnalyzer, norm } = require("../ts-plugin/analyzer.js");
 const twee = require("../ts-plugin/twee.js");
 
+// Upper bound on augmentation regeneration passes (see main). A fixed point is
+// reached in two or three for any real project; this only guarantees the loop
+// terminates if recovery ever oscillates.
+const MAX_GENERATION_PASSES = 8;
+
 function fail(message) {
   process.stderr.write(`tw-sugarcube-lint: ${message}\n`);
   process.exit(2); // 2 = the linter itself could not run; 1 = lint findings
@@ -204,14 +209,31 @@ function main() {
     return sf;
   };
 
-  // Pass 1: a program with an empty augmentation, purely to recover member
-  // types by scanning assignments. Pass 2: type-check against the real one.
+  // Generate the augmentation, then type-check against it. One pass is not
+  // enough: a recovered member type can DEPEND on a previously recovered one.
+  // `<<set $hero to setup.makeHero()>>` can only be typed once `setup.makeHero`
+  // itself has been declared, so against the empty-augmentation program it comes
+  // back `any` — and every error downstream of it silently disappears. The
+  // editor plugin regenerates on each program update until the content stops
+  // changing (ts-plugin/index.js `refresh`); iterate to that same fixed point
+  // here, or the linter reports clean on code the extension squiggles.
   let program = ts.createProgram(rootNames, parsed.options, host);
-  synthetic.set(
-    norm(augPath),
-    analyzer.generate(program, augPath, opts.strict, opts.typoDetection && opts.strict, projections)
-  );
-  program = ts.createProgram(rootNames, parsed.options, host);
+  let converged = false;
+  for (let pass = 0; pass < MAX_GENERATION_PASSES; pass++) {
+    const next = analyzer.generate(program, augPath, opts.strict, opts.typoDetection && opts.strict, projections);
+    if (next === synthetic.get(norm(augPath))) { converged = true; break; }
+    synthetic.set(norm(augPath), next);
+    program = ts.createProgram(rootNames, parsed.options, host);
+  }
+  // Recovery normally settles in two or three passes. If it hasn't, the findings
+  // below are from a snapshot mid-flight rather than a settled one — say so
+  // rather than presenting them as the whole truth.
+  if (!converged) {
+    process.stderr.write(
+      `tw-sugarcube-lint: warning: recovered member types did not settle after ` +
+      `${MAX_GENERATION_PASSES} passes; some findings may be missing\n`
+    );
+  }
 
   const findings = collectFindings(ts, program, projections, augPath);
   report(findings, opts.format);
