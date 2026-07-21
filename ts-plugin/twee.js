@@ -35,6 +35,29 @@ const EXPRESSION_MACROS = new Set(["=", "-", "print", "run", "capture"]);
 // Macros whose body is a condition.
 const CONDITION_MACROS = new Set(["if", "elseif", "unless"]);
 
+// Conditional macros that open a block, and the closing tags that end one.
+// SugarCube accepts both the `<</if>>` and `<<endif>>` spellings.
+const BLOCK_OPEN = new Set(["if", "unless"]);
+const BLOCK_CLOSE = new Map([
+  ["/if", "if"], ["endif", "if"], ["/unless", "unless"], ["endunless", "unless"],
+]);
+
+// A condition we can't project (an empty `<<if>>`) still has to open a block, or
+// the chain's `<</if>>` would close something that was never opened. `any` keeps
+// it from narrowing anything, and being raw scaffolding no diagnostic can land
+// on it.
+const OPAQUE_CONDITION = "0 as any";
+
+// Passages are entered independently, in whatever order the story takes, so each
+// one is projected into its own block. Control flow reaching the next passage
+// merges the "previous passage ran" and "it didn't" paths, which restores every
+// member's declared type: without this, a `<<set $item to null>>` in an init
+// passage would narrow `$item` to `null` for every passage below it in the file
+// — turning a later `<<if $item>>` into `never` and reporting a use of `$item`
+// as a null argument.
+const PASSAGE_OPEN = `if (${OPAQUE_CONDITION}) {\n`;
+const PASSAGE_CLOSE = "\n}\n";
+
 class Builder {
   constructor() {
     this.ts = "";
@@ -252,9 +275,81 @@ function splitMacro(inner, innerBase) {
   if (inner[k] === "=" || inner[k] === "-") {
     return { name: inner[k], argStart: innerBase + k + 1, arg: inner.slice(k + 1) };
   }
-  let e = k;
+  // A closing tag: the `/` is part of the name, so `<</if>>` is distinguishable
+  // from the `<<if>>` it closes.
+  const slash = inner[k] === "/" ? 1 : 0;
+  let e = k + slash;
   while (e < inner.length && /[A-Za-z0-9_]/.test(inner[e])) e++;
   return { name: inner.slice(k, e), argStart: innerBase + e, arg: inner.slice(e) };
+}
+
+// The offsets of the `::` passage headers, which are the boundaries between
+// passages: a header is a `::` at the start of a line. A `::` inside a macro
+// body isn't one — splitting a macro in half there would emit half a statement.
+function passageStarts(text, macros) {
+  const out = [];
+  for (let i = 0; i < text.length - 1; i++) {
+    if (text[i] !== ":" || text[i + 1] !== ":") continue;
+    if (i > 0 && text[i - 1] !== "\n") continue;
+    if (macros.some((m) => i > m.start && i < m.end)) continue;
+    out.push(i);
+    i++;
+  }
+  return out;
+}
+
+/**
+ * Pair each `<<if>>` / `<<unless>>` with its `<<elseif>>`, `<<else>>` and
+ * closing tag, so a whole chain can be projected as real TypeScript control
+ * flow and the condition narrows the code it guards.
+ *
+ * Only complete, properly nested chains that stay inside one passage qualify.
+ * Everything else keeps the self-contained `if (...) {}` emission: an
+ * unbalanced brace is a syntax error that takes down the projection of the
+ * WHOLE file, which is a far worse failure than a missing narrowing — and a
+ * half-written chain is the normal state of a file being typed into.
+ *
+ * @returns Map of macro index -> "open" | "elseif" | "else" | "close"
+ */
+function pairBlocks(macros, parts, boundaries) {
+  const roles = new Map();
+  const stack = [];
+  let b = 0;
+  for (let i = 0; i < macros.length; i++) {
+    // A passage header abandons whatever is open: a block never spans passages,
+    // and a stray `<<if>>` must not swallow the next passage's `<</if>>`.
+    while (b < boundaries.length && boundaries[b] <= macros[i].start) { stack.length = 0; b++; }
+    const part = parts[i];
+    if (!part) continue;
+    const name = part.name;
+    if (BLOCK_OPEN.has(name)) {
+      stack.push({ open: i, kind: name, branches: [], closed: false });
+      continue;
+    }
+    if (name === "else" || name === "elseif") {
+      // Everything after an `<<else>>` is malformed markup — a second `else`
+      // would emit `else {} else {}` — so the chain stops taking branches
+      // there and the extras fall back.
+      const frame = stack[stack.length - 1];
+      if (frame && !frame.closed) {
+        frame.branches.push(i);
+        if (name === "else") frame.closed = true;
+      }
+      continue;
+    }
+    const closes = BLOCK_CLOSE.get(name);
+    if (!closes) continue;
+    // A mismatched close (`<</if>>` while an `<<unless>>` is innermost) means
+    // the markup is crossed; drop the frames it skipped so they fall back
+    // rather than pairing a close with the wrong open.
+    while (stack.length && stack[stack.length - 1].kind !== closes) stack.pop();
+    if (!stack.length) continue;
+    const frame = stack.pop();
+    roles.set(frame.open, "open");
+    for (const idx of frame.branches) roles.set(idx, parts[idx].name);
+    roles.set(i, "close");
+  }
+  return roles;
 }
 
 // Naked `$story` / `_temporary` references in passage prose (outside macros) —
@@ -294,28 +389,73 @@ function emitProseVariables(builder, text, base, from, to) {
 function project(text) {
   const builder = new Builder();
   const macros = findMacros(text);
-  let cursor = 0;
+  const allParts = macros.map((m) => splitMacro(m.inner, m.start + 2));
+  const boundaries = passageStarts(text, macros);
+  const roles = pairBlocks(macros, allParts, boundaries);
 
-  for (const macro of macros) {
-    emitProseVariables(builder, text, 0, cursor, macro.start);
+  let cursor = 0;
+  let boundary = 0;
+  let passageOpen = false;
+  const openPassage = () => { builder.raw(PASSAGE_OPEN); passageOpen = true; };
+  const closePassage = () => { if (passageOpen) { builder.raw(PASSAGE_CLOSE); passageOpen = false; } };
+  // A file that opens with a header has no text before it — don't emit an empty
+  // block for the nothing in front of the first passage.
+  if (!boundaries.length || boundaries[0] > 0) openPassage();
+
+  // Advance to `offset`, projecting the prose (and crossing any passage
+  // boundary) in between. Paired blocks never span a boundary, so nothing of
+  // ours is open when a passage block closes.
+  const advanceTo = (offset) => {
+    while (boundary < boundaries.length && boundaries[boundary] <= offset) {
+      const at = boundaries[boundary++];
+      if (at > cursor) { emitProseVariables(builder, text, 0, cursor, at); cursor = at; }
+      closePassage();
+      openPassage();
+    }
+    if (offset > cursor) { emitProseVariables(builder, text, 0, cursor, offset); cursor = offset; }
+  };
+
+  for (let i = 0; i < macros.length; i++) {
+    const macro = macros[i];
+    advanceTo(macro.start);
     cursor = macro.end;
 
-    const parts = splitMacro(macro.inner, macro.start + 2);
+    const parts = allParts[i];
     if (!parts) continue;
     const { name, arg, argStart } = parts;
+    const role = roles.get(i);
 
     // The scaffolding that closes each emission starts on its own line: the
     // argument may end in a `//` comment, which would otherwise swallow the
     // `;` / `) {}` and leave the projection syntactically broken.
-    if (EXPRESSION_MACROS.has(name)) {
+    if (role === "close") {
+      builder.raw("\n}\n");
+    } else if (role === "else") {
+      builder.raw("\n} else {\n");
+    } else if (role === "open" || role === "elseif") {
+      // A paired conditional guards a real block, so its body is narrowed by
+      // the condition — and by its negation in the `<<else>>`.
+      const negate = role === "open" && name === "unless";
+      builder.raw(role === "elseif" ? "\n} else if (" : "if (");
+      if (!arg.trim()) {
+        builder.raw(`${OPAQUE_CONDITION}\n) {\n`);
+      } else {
+        if (negate) builder.raw("!(");
+        emitExpression(builder, arg, argStart, { allowTo: false });
+        builder.raw(negate ? "\n)) {\n" : "\n) {\n");
+      }
+    } else if (EXPRESSION_MACROS.has(name)) {
       if (!arg.trim()) continue;
       emitExpression(builder, arg, argStart, { allowTo: false });
       builder.raw("\n;\n");
     } else if (CONDITION_MACROS.has(name)) {
+      // Unpaired: the condition is still checked, but it guards nothing, so the
+      // emission has to be self-contained.
       if (!arg.trim()) continue;
-      builder.raw("if (");
+      const negate = name === "unless";
+      builder.raw(negate ? "if (!(" : "if (");
       emitExpression(builder, arg, argStart, { allowTo: false });
-      builder.raw("\n) {}\n");
+      builder.raw(negate ? "\n)) {}\n" : "\n) {}\n");
     } else if (name === "set") {
       if (!arg.trim()) continue;
       emitExpression(builder, arg, argStart, { allowTo: true });
@@ -325,7 +465,8 @@ function project(text) {
     // argument grammar (bare words, links), not JavaScript. Projecting them
     // would invent errors, so they're skipped.
   }
-  emitProseVariables(builder, text, 0, cursor, text.length);
+  advanceTo(text.length);
+  closePassage();
 
   return { ts: builder.ts, segments: builder.segments };
 }

@@ -68,6 +68,31 @@ get hover, completion, go-to-definition, and diagnostics for
 including in `.ts` files that read it. Passages update **live** — you don't have
 to save first; the unsaved buffer is pushed to the language service as you type.
 
+### Narrowing in `<<if>>`
+
+A closed `<<if>>` narrows what it guards, exactly as the equivalent `if` would
+in TypeScript — so a variable that is only sometimes set can be used inside the
+check without complaint, and is still checked outside it:
+
+```
+:: Shop
+<<if $item>>
+  <<run setup.equip($item)>>     <-- $item is Item here, not Item | null
+<<else>>
+  <<run setup.equip($item)>>     <-- and null here, so this is an error
+<</if>>
+<<run setup.equip($item)>>       <-- unguarded: an error
+```
+
+`<<elseif>>`, `<<else>>`, `<<unless>>` and the `<<endif>>` spelling are all
+understood, blocks nest, and a type test narrows too —
+`<<if typeof $mix is "number">>` gives you a number inside. A chain that isn't
+closed still type-checks its condition; it just doesn't narrow anything.
+
+Each passage is narrowed on its own, because passages don't run in file order:
+a `<<set $item to null>>` in an init passage doesn't make `$item` null for
+every passage below it in the file.
+
 Two features are workarounds for a bug in **Twee 3 Language Tools ≤ 0.34.0**,
 whose definition provider never resolves and blocks native ctrl+click for *every*
 extension in `.twee` files (see `docs/twee3-language-tools-definition-hang.md`).

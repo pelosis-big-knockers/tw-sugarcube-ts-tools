@@ -1,0 +1,27 @@
+:: StoryTitle
+Narrowing Fixture
+
+:: Init
+<<set $item to null>>
+<<set $mix to 1>>
+
+:: Shop
+<<set $item to setup.makeItem()>>
+<<set $mix to "text">>
+
+:: Guarded
+<<if $item>>
+<<run setup.useItem($item)>>
+<</if>>
+<<if typeof $mix is "number">>
+<<run setup.needNumber($mix)>>
+<</if>>
+
+:: Unguarded
+<<run setup.useItem($item)>>
+
+:: ElseBranch
+<<if $item>>
+<<else>>
+<<run setup.useItem($item)>>
+<</if>>

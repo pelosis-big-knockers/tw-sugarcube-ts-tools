@@ -257,6 +257,60 @@ async function main() {
   check("no projected file written to the workspace",
     !existsSync(path.join(tweeFixture, "story.twee.ts")), "projection leaked to disk");
 
+  // ---------- <<if>> narrows the code it guards ----------
+  // A closed `<<if>>` projects to a real TypeScript block, so the condition
+  // narrows its body: `<<if $item>>` means `$item` is not null until the
+  // `<<else>>` / `<</if>>`. The fixture's variables are unions (`Item | null`,
+  // `number | string`) assigned across several passages, so every check here
+  // fails without narrowing — or fails the other way, silently accepting the
+  // unguarded use, if narrowing leaks past the block it belongs to.
+  console.log("\n<<if>> narrowing:");
+  const narrowFixture = path.join(testDir, "fixture-twee-narrow");
+  const narrowWorld = toPosix(path.join(narrowFixture, "world.ts"));
+  const narrowTwee = path.join(narrowFixture, "story.twee");
+  const narrowProjected = toPosix(narrowTwee) + ".ts";
+  const narrowRun = await withServer(narrowFixture, async ({ proj, send, wait, diagnostics, lastOf }) => {
+    send("open", { file: narrowWorld, projectRootPath: proj });
+    await wait(2600);
+
+    // The augmentation settles over successive language-service calls (each one
+    // regenerates from the last), and this fixture's types come from passages
+    // that the first generation hasn't typed yet. An editor asks repeatedly; so
+    // does this.
+    let diags = [];
+    for (let i = 0; i < 4 && diags.length < 2; i++) {
+      send("semanticDiagnosticsSync", { file: narrowProjected });
+      await wait(1500);
+      diags = diagnostics();
+    }
+    // Which line an error lands on is the whole point: the same call is clean
+    // inside the guard and an error outside it, so the messages alone can't
+    // tell the two apart.
+    const projTs = projectTwee(readFileSync(narrowTwee, "utf8")).ts;
+    const atGuarded = positionOf(projTs, "useItem(State.variables.item");
+    const guardedLines = [atGuarded.line, positionOf(projTs, "needNumber(State.variables.mix").line];
+    const errorLines = (lastOf("semanticDiagnosticsSync")?.body ?? []).map((d) => d.start.line);
+    check("a guarded use of a nullable variable is clean",
+      !errorLines.some((l) => guardedLines.includes(l)),
+      `errors on lines ${errorLines.join(",")}; guarded lines ${guardedLines.join(",")}`);
+    check("the same use without a guard is still an error",
+      diags.some((d) => /Argument of type '(Item \| null|null \| Item)'/.test(d)), diags.join(" | "));
+    check("the <<else>> branch does not keep the narrowing",
+      diags.some((d) => /Argument of type 'null'/.test(d)), diags.join(" | "));
+    // Two deliberate errors, one per unguarded passage. A third means the
+    // projection invented something the author never wrote.
+    check("no other diagnostics in the narrowing fixture", diags.length === 2, diags.join(" | "));
+
+    // Hover is the feature as the author meets it: inside the block the
+    // variable reads as `Item`, not `Item | null`.
+    send("quickinfo", { file: narrowProjected, line: atGuarded.line, offset: atGuarded.offset + "useItem(State.variables.".length });
+    await wait(900);
+    const hover = lastOf("quickinfo")?.body?.displayString ?? "";
+    check("hover inside the block shows the narrowed type",
+      /item: Item$/m.test(hover) || /\bItem\b/.test(hover) && !/null/.test(hover), hover || "(no quickinfo)");
+  });
+  check("no language-service crash (narrowing)", !narrowRun.crashed, "Debug Failure seen");
+
   // ---------- a .twee CREATED after the project loaded ----------
   // A newly created (or renamed) .twee never touches a .ts file, so nothing
   // re-runs getExternalFiles — and even when it does, getExternalFiles is only
@@ -275,10 +329,12 @@ async function main() {
     await wait(2600);
 
     // Create the passage AFTER the project is up — the user's scenario.
-    writeFileSync(createdTwee, ":: Start\n<<run setup.attack(3)>>\n");
+    const createdText = ":: Start\n<<run setup.attack(3)>>\n";
+    writeFileSync(createdTwee, createdText);
     await wait(1600); // watcher debounce (150ms) + project reload
 
-    send("quickinfo", { file: createdProjected, line: 1, offset: 8 });
+    const atCreated = positionOf(projectTwee(createdText).ts, "attack(");
+    send("quickinfo", { file: createdProjected, line: atCreated.line, offset: atCreated.offset });
     await wait(900);
     const hover = lastOf("quickinfo")?.body?.displayString ?? "";
     check("a passage created after load is analyzed without a reload",

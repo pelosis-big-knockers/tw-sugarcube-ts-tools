@@ -50,6 +50,22 @@ console.log("lint CLI\n");
   check("exit code is 1 when there are findings", r.code === 1, `exit ${r.code}`);
 }
 
+// --- <<if>> narrows, and the spans still map through the nested blocks ------
+// A closed `<<if>>` projects to a real TypeScript block. The guarded uses in
+// this fixture are only clean because of the narrowing, the unguarded ones are
+// only errors because it stops at the block — and the projection now nests, so
+// the reported spans prove the position map survived it.
+{
+  const r = lint("fixture-twee-narrow");
+  check("an <<if>>-guarded use of a nullable variable is clean",
+    !/story\.twee:1[4-8]:/.test(r.out), r.out);
+  check("the same use outside the guard is reported",
+    /story\.twee:21:21\s+error\s+TS2345.*'Item \| null'/.test(r.out), r.out);
+  check("the <<else>> branch gets the negated type",
+    /story\.twee:26:21\s+error\s+TS2345.*'null'/.test(r.out), r.out);
+  check("nothing else is reported", /2 problems/.test(r.out), r.out);
+}
+
 // --- a clean project exits 0 -----------------------------------------------
 {
   const r = lint("fixture-lint-clean"); // reads passage-created variables, all valid
