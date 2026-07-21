@@ -7,3 +7,4 @@ docs/**
 *.vsix
 node_modules/**
 !node_modules/tw-sugarcube-ts-plugin/**
+.claude
