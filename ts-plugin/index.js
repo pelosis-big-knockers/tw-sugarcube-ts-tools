@@ -31,6 +31,11 @@ function init(modules) {
 
   const PROPERTY_MISSING = new Set([2339, 2551, 2552]);
 
+  // Code for our own downgrade warning. Deliberately far outside TypeScript's
+  // range so it can never collide with a real TS diagnostic, and so a project
+  // that wants to silence it can match on the number.
+  const DOWNGRADED_CODE = 990001;
+
   const norm = (p) => String(p).replace(/\\/g, "/").toLowerCase();
   const virtualFor = (dir) => String(dir).replace(/\\/g, "/").replace(/\/+$/, "") + "/__sugarcube-generated__.d.ts";
 
@@ -340,8 +345,12 @@ function init(modules) {
 
     // This project's projections, keyed the way the analyzer expects.
     const scan = (program, checker) => analyzer.scan(program, checker, virtualFile, pstate.tweeFiles);
-    const generate = (program, strict, typos) =>
-      analyzer.generate(program, virtualFile, strict, typos, pstate.tweeFiles);
+    // Members whose real type couldn't be declared, from the most recent
+    // generation. They become warning squiggles on the assignment itself: a
+    // member silently typed `any` is exactly the failure the author can't see.
+    let downgrades = [];
+    const generate = (program, strict, typos, collect) =>
+      analyzer.generate(program, virtualFile, strict, typos, pstate.tweeFiles, collect);
 
     // Item 9: the checkerless scan (assignment sites, no types) is what
     // completions and go-to-definition need, and each request re-walked every
@@ -487,7 +496,12 @@ function init(modules) {
       refreshing = true;
       try {
         lastProgram = program;
-        const next = generate(program, strict, typoDetection);
+        const collect = [];
+        const next = generate(program, strict, typoDetection, collect);
+        if (collect.length !== downgrades.length) {
+          log(`${collect.length} member(s) too complex to type; declared any`);
+        }
+        downgrades = collect;
         if (next !== state.content) {
           state.content = next;
           invalidate();
@@ -510,21 +524,46 @@ function init(modules) {
       proxy[k] = (...args) => orig.apply(ls, args);
     }
 
+    // A member we couldn't type is reported on the assignment that created it,
+    // so the one place the author can act on it is the one place it shows up.
+    function downgradeDiagnostics(fileName) {
+      if (!downgrades.length) return [];
+      const program = ls.getProgram();
+      const sf = program && program.getSourceFile(fileName);
+      if (!sf) return [];
+      const out = [];
+      for (const d of downgrades) {
+        if (norm(d.inProgram.fileName) !== norm(fileName)) continue;
+        out.push({
+          file: sf,
+          start: d.inProgram.start,
+          length: Math.max(1, d.inProgram.end - d.inProgram.start),
+          messageText: d.message,
+          category: ts.DiagnosticCategory.Warning,
+          code: DOWNGRADED_CODE,
+          source: "tw-sugarcube",
+        });
+      }
+      return out;
+    }
+
     proxy.getSemanticDiagnostics = (fileName) => {
       refresh();
       const prior = ls.getSemanticDiagnostics(fileName);
+      const extra = downgradeDiagnostics(fileName);
       // With generation working the members are declared, so "does not exist" is a
       // real typo and must survive. Only fall back to suppressing if generation
       // failed, so a broken generator can't spam a project with errors.
-      if (generationOk) return prior;
+      if (generationOk) return extra.length ? prior.concat(extra) : prior;
       const program = ls.getProgram();
       const sf = program && program.getSourceFile(fileName);
       if (!sf) return prior;
       const checker = program.getTypeChecker();
-      return prior.filter((d) => {
+      const kept = prior.filter((d) => {
         if (!PROPERTY_MISSING.has(d.code) || typeof d.start !== "number") return true;
         return !memberAt(sf, d.start, checker);
       });
+      return extra.length ? kept.concat(extra) : kept;
     };
 
     proxy.getQuickInfoAtPosition = (fileName, position) => {

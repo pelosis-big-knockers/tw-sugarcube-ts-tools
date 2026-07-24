@@ -2,3 +2,7 @@ node_modules
 *.vsix
 test/*.log
 .claude
+# Sized from the analyzer's cap and written by test/lint-cli.mjs, so these are
+# generated rather than committed.
+test/fixture-downgrade/big.ts
+test/fixture-downgrade-twee/story.twee

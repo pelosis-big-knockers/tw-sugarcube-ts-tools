@@ -27,9 +27,57 @@ const ALL_INTERFACES = [
 // asks for — closing it would report every real setting as a typo.
 const NEVER_CLOSED = new Set(["SugarCubeSettingVariables"]);
 
-const MAX_TYPE_LENGTH = 400;
+// A recovered type is written verbatim into the generated augmentation, so a
+// pathological serialization (a deeply instantiated generic, a huge union) would
+// bloat a file that tsserver re-parses on every regeneration. Hence a cap — but
+// it only exists to catch that pathology, and it is NOT a judgement about how
+// big an author's data is allowed to be. A plain table of items,
+//
+//   setup.items = [{ key: "flowers", name: "Wildflowers", price: 30 }, ...] as const;
+//
+// serializes every literal member of every element, so three modest rows already
+// run past 400 characters; capping there quietly typed real, ordinary story data
+// `any` while the identical array of bare strings came through fine.
+const MAX_TYPE_LENGTH = 8000;
 const IDENTIFIER = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
 const norm = (p) => String(p).replace(/\\/g, "/").toLowerCase();
+
+// How each container is spelled in author code, for messages about its members.
+const CONTAINER_DISPLAY = {
+  SugarCubeSetupObject: "setup",
+  SugarCubeSettingVariables: "settings",
+  SugarCubeStoryVariables: "State.variables",
+  SugarCubeTemporaryVariables: "State.temporary",
+};
+
+// A member whose type can't be declared falls back to `any`, which costs the
+// author every check on that member — silently, at the one place they'd never
+// think to look. So each fallback carries a reason out to the caller, which
+// surfaces it as a warning (the linter as a finding, the plugin as a squiggle on
+// the assignment).
+//
+// The advice is the same for both real reasons and it does work: a type that is
+// NAMED and GLOBAL serializes to just its name, and the generated augmentation
+// can reference it. SugarCube sources are usually scripts rather than modules,
+// so an `interface Gift {...}` in one of them is already global.
+const ADVICE = "Give it a named global type (an interface or type alias in a non-module file) to keep it checked.";
+const DOWNGRADE_REASON = {
+  tooLong: (subject, detail) =>
+    `Type of '${subject}' serializes to ${detail} characters, over the ${MAX_TYPE_LENGTH}-character limit, ` +
+    `so '${subject}' is typed 'any'. ${ADVICE}`,
+  moduleScoped: (subject) =>
+    `Type of '${subject}' is declared inside a module, so it can only be written as an 'import(...)' type ` +
+    `that the generated declarations can't reference; '${subject}' is typed 'any'. ${ADVICE}`,
+  unprintable: (subject) =>
+    `Type of '${subject}' could not be written as a single-line type, so '${subject}' is typed 'any'. ${ADVICE}`,
+};
+
+// `setup.gifts`, but `setup["odd name"]` when the member isn't an identifier —
+// the spelling the author would search for.
+function memberDisplay(iface, name) {
+  const container = CONTAINER_DISPLAY[iface] || iface;
+  return IDENTIFIER.test(name) ? `${container}.${name}` : `${container}[${JSON.stringify(name)}]`;
+}
 
 // Quote a member name only when it isn't a plain identifier. TypeScript echoes
 // the declaration's own spelling back in hover and completion detail, so a
@@ -119,14 +167,19 @@ function createAnalyzer(ts) {
   // Module-scoped types serialize as `import("...").X`, which wouldn't resolve
   // inside the generated file; fall back to `any` rather than emit something
   // broken. Same for pathological types.
+  //
+  // Returns `{ text, reason, detail }`: `reason` is null when the type came
+  // through intact, and otherwise names why it didn't, so the caller can warn
+  // instead of letting the member quietly become `any`.
   function typeStringOf(checker, expr) {
     let type = checker.getWidenedType(checker.getTypeAtLocation(expr));
     type = checker.getBaseTypeOfLiteralType(type);
     const text = checker.typeToString(type, expr, FORMAT);
-    if (!text || /\bimport\(/.test(text) || text.length > MAX_TYPE_LENGTH || /[\r\n]/.test(text)) {
-      return "any";
-    }
-    return text;
+    if (!text) return { text: "any", reason: "unprintable" };
+    if (/\bimport\(/.test(text)) return { text: "any", reason: "moduleScoped" };
+    if (text.length > MAX_TYPE_LENGTH) return { text: "any", reason: "tooLong", detail: text.length };
+    if (/[\r\n]/.test(text)) return { text: "any", reason: "unprintable" };
+    return { text, reason: null };
   }
 
   // Translate an assignment site inside a passage projection back to the .twee
@@ -143,8 +196,10 @@ function createAnalyzer(ts) {
    * checker is supplied, member types (for generation).
    *
    * @param projections Map of normalized projection path -> { segments, source }
+   * @param downgrades  Optional array; each member that fell back to `any`
+   *                    despite having a real type is pushed onto it.
    */
-  function scan(program, checker, skipFile, projections) {
+  function scan(program, checker, skipFile, projections, downgrades) {
     const found = new Map();
     const entryFor = (iface) => {
       if (!found.has(iface)) found.set(iface, { members: new Map(), dynamic: false });
@@ -200,7 +255,26 @@ function createAnalyzer(ts) {
                   ? tweeSite(projection, start, end)
                   : { fileName: sf.fileName, start, end };
                 if (site) member.sites.push(site);
-                if (checker && contributesType) member.types.add(typeStringOf(checker, node.right));
+                if (checker && contributesType) {
+                  const typed = typeStringOf(checker, node.right);
+                  member.types.add(typed.text);
+                  // No site means the assignment is scaffolding we generated
+                  // rather than author text — there is nothing to point at and
+                  // nothing they could change, so it isn't worth a warning.
+                  if (typed.reason && downgrades && site) {
+                    downgrades.push({
+                      container: iface,
+                      member: name,
+                      reason: typed.reason,
+                      message: DOWNGRADE_REASON[typed.reason](memberDisplay(iface, name), typed.detail),
+                      site, // mapped back to the .twee document when it came from one
+                      // Where the span lives in the Program, which is the
+                      // projection for a passage. The plugin attaches its
+                      // squiggle here, since that is the file tsserver asks about.
+                      inProgram: { fileName: sf.fileName, start, end },
+                    });
+                  }
+                }
               }
             }
           }
@@ -217,9 +291,13 @@ function createAnalyzer(ts) {
    *
    * @param strict         declare recovered member types (false = fully permissive)
    * @param typoDetection  close containers, so an unknown member is an error
+   * @param downgrades     Optional array, filled with the members that fell back
+   *                       to `any`. Only collected under `strict`: permissive
+   *                       mode declares no types at all, so `any` is the point
+   *                       there rather than a loss worth reporting.
    */
-  function generate(program, skipFile, strict, typoDetection, projections) {
-    const found = scan(program, program.getTypeChecker(), skipFile, projections);
+  function generate(program, skipFile, strict, typoDetection, projections, downgrades) {
+    const found = scan(program, program.getTypeChecker(), skipFile, projections, strict ? downgrades : null);
     // Every container is described, even if nothing was assigned to it here.
     for (const name of ALL_INTERFACES) {
       if (!found.has(name)) found.set(name, { members: new Map(), dynamic: true });
@@ -253,4 +331,6 @@ function createAnalyzer(ts) {
   return { interfaceFor, typeStringOf, scan, generate, isIdent, isDotted };
 }
 
-module.exports = { createAnalyzer, ALL_INTERFACES, NEVER_CLOSED, propertyKey, norm };
+module.exports = {
+  createAnalyzer, ALL_INTERFACES, NEVER_CLOSED, propertyKey, norm, memberDisplay, MAX_TYPE_LENGTH,
+};

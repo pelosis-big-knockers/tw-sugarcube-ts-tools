@@ -163,6 +163,36 @@ everywhere else.
 If typing is ever wrong for your story, set **`twSugarcube.strict: false`** to drop
 the recovered types entirely; completion and go-to-definition keep working.
 
+### When a type can't be declared
+
+Recovered types are written into a generated declaration file, and two kinds of
+type can't be written there: one that's too large to serialize, and one declared
+inside a module (it can only be spelled as an `import(...)` type, which the
+generated file can't reference). Either way the member falls back to `any`.
+
+That used to happen silently, which is the worst way for it to happen — every
+check on the member stops, and nothing says why. Now it's a **warning on the
+assignment**:
+
+```ts
+setup.gifts = gifts;
+//   ^ Type of 'setup.gifts' serializes to 10879 characters, over the
+//     8000-character limit, so 'setup.gifts' is typed 'any'.
+```
+
+The fix is to give the value a **named global type** — an `interface` or `type`
+in a file with no imports or exports, which SugarCube sources usually are. A
+named type serializes to just its name, so it fits and it resolves:
+
+```ts
+interface Gift { key: string; name: string; price: number; }
+const gifts: readonly Gift[] = [ /* ... */ ];
+setup.gifts = gifts;   // -> readonly Gift[], fully checked
+```
+
+These are warnings, not errors: nothing is wrong with your story, so they never
+fail a build.
+
 ### Typo detection (opt-in)
 
 Set **`twSugarcube.typoDetection: true`** (requires `strict`) to close the
@@ -192,9 +222,11 @@ npx tw-sugarcube-lint . --json     # machine-readable
 
 It builds a program from your `tsconfig.json`, checks passage code the same way
 the editor does, and maps errors back onto `.twee` spans. Exit code is **0** when
-clean, **1** on findings, **2** if the linter itself couldn't run — so CI just
-checks the exit code. It shares the exact analysis core the editor uses, so the
-two can't disagree.
+clean, **1** on errors, **2** if the linter itself couldn't run — so CI just
+checks the exit code. Warnings (such as [a type that couldn't be
+declared](#when-a-type-cant-be-declared)) are reported but don't affect the exit
+code. It shares the exact analysis core the editor uses, so the two can't
+disagree.
 
 The linter needs the JavaScript compiler API, which the **native TypeScript 7.x**
 compiler does not expose. If your project is on 7.x, it falls back to the

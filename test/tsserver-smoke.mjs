@@ -438,6 +438,44 @@ async function main() {
   });
   check("no language-service crash (passage variables)", !varsRun.crashed, "Debug Failure seen");
 
+  // ---------- a member that couldn't be typed warns in the editor ----------
+  // The editor is where the loss actually bites: the member reads as `any`, every
+  // check on it silently stops, and nothing says why. The warning has to land on
+  // the assignment, because that is the only place the author can fix it.
+  console.log("\ndowngraded members:");
+  const downFixture = path.join(testDir, "fixture-downgrade");
+  const downWorld = toPosix(path.join(downFixture, "world.ts"));
+  const downAdvice = toPosix(path.join(downFixture, "advice.ts"));
+  const downRun = await withServer(downFixture, async ({ proj, send, wait, diagnostics, lastOf }) => {
+    send("open", { file: downWorld, projectRootPath: proj });
+    await wait(2600);
+
+    send("semanticDiagnosticsSync", { file: downWorld });
+    await wait(1600);
+    const diags = diagnostics();
+    check("the editor warns that the member was typed any",
+      diags.some((d) => /'setup\.gift' is typed 'any'/.test(d)), diags.join(" | ") || "(no diagnostics)");
+
+    // Category and span matter: an error would fail builds over something that
+    // isn't the story's fault, and the wrong span sends the author hunting.
+    const body = lastOf("semanticDiagnosticsSync")?.body ?? [];
+    const warn = body.find((d) => /typed 'any'/.test(d.text));
+    check("...as a warning, not an error", !!warn && warn.category === "warning",
+      warn ? warn.category : "(not found)");
+    check("...on the assignment that caused it",
+      !!warn && warn.start.line === 5, warn ? `line ${warn.start.line}` : "(not found)");
+
+    // The control: a member whose type came through must stay silent, or the
+    // warning is just noise on every project.
+    send("open", { file: downAdvice, projectRootPath: proj });
+    await wait(1200);
+    send("semanticDiagnosticsSync", { file: downAdvice });
+    await wait(1600);
+    const clean = diagnostics();
+    check("a fully typed member is not warned about", clean.length === 0, clean.join(" | "));
+  });
+  check("no language-service crash (downgraded members)", !downRun.crashed, "Debug Failure seen");
+
   // ---------- editing a passage after the project has loaded ----------
   // tsserver never watches .twee files, so nothing makes it call getExternalFiles
   // again after an edit. Without an explicit re-projection the declarations stay

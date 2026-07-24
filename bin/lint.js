@@ -219,8 +219,14 @@ function main() {
   // here, or the linter reports clean on code the extension squiggles.
   let program = ts.createProgram(rootNames, parsed.options, host);
   let converged = false;
+  // Only the settled pass's downgrades are real: an early pass sees members that
+  // later passes go on to type, so reporting from one would warn about types
+  // that recovery was still in the middle of resolving.
+  let downgrades = [];
   for (let pass = 0; pass < MAX_GENERATION_PASSES; pass++) {
-    const next = analyzer.generate(program, augPath, opts.strict, opts.typoDetection && opts.strict, projections);
+    const pending = [];
+    const next = analyzer.generate(program, augPath, opts.strict, opts.typoDetection && opts.strict, projections, pending);
+    downgrades = pending;
     if (next === synthetic.get(norm(augPath))) { converged = true; break; }
     synthetic.set(norm(augPath), next);
     program = ts.createProgram(rootNames, parsed.options, host);
@@ -235,12 +241,45 @@ function main() {
     );
   }
 
-  const findings = collectFindings(ts, program, projections, augPath);
+  const findings = collectFindings(ts, program, projections, augPath)
+    .concat(downgradeFindings(program, projections, downgrades));
+  findings.sort((a, b) => (a.file === b.file ? a.line - b.line : a.file < b.file ? -1 : 1));
   report(findings, opts.format);
   // exitCode, not process.exit(): on Windows a piped stdout drains
   // asynchronously, and process.exit() truncates whatever hasn't flushed —
   // a large --json report would come out cut off mid-stream in CI.
-  process.exitCode = findings.length ? 1 : 0;
+  //
+  // Errors decide the exit code, not the finding count: a downgrade warning says
+  // the linter gave up on a type, not that the story is wrong, and failing CI on
+  // one would turn a project red without a line of its code changing.
+  process.exitCode = findings.some((f) => f.category === "Error") ? 1 : 0;
+}
+
+// Locate each downgrade in the file the author actually edits. The analyzer
+// already mapped passage sites back onto their .twee document, so this only has
+// to turn an offset into a line and column — via the projection's text for a
+// passage, and the Program's own SourceFile for anything else.
+function downgradeFindings(program, projections, downgrades) {
+  if (!downgrades.length) return [];
+  const bySource = new Map();
+  for (const p of projections.values()) bySource.set(norm(p.source), p);
+  const out = [];
+  for (const d of downgrades) {
+    const finding = { code: null, message: d.message, category: "Warning", rule: `type-downgraded/${d.reason}`, file: d.site.fileName };
+    const projection = bySource.get(norm(d.site.fileName));
+    if (projection) {
+      const lineStarts = projection.lineStarts || (projection.lineStarts = lineStartsOf(projection.text));
+      Object.assign(finding, lineColAt(lineStarts, d.site.start));
+    } else {
+      const sf = program.getSourceFile(d.site.fileName);
+      if (!sf) continue; // nothing to point at; better silent than a bogus location
+      const lc = sf.getLineAndCharacterOfPosition(d.site.start);
+      finding.line = lc.line + 1;
+      finding.column = lc.character + 1;
+    }
+    out.push(finding);
+  }
+  return out;
 }
 
 // Map a diagnostic to a user-facing location, translating passage projections
@@ -310,7 +349,10 @@ function report(findings, format) {
   }
   const rel = (f) => path.relative(process.cwd(), f).replace(/\\/g, "/");
   for (const f of findings) {
-    process.stdout.write(`${rel(f.file)}:${f.line}:${f.column}  ${f.category.toLowerCase()}  TS${f.code}  ${f.message}\n`);
+    // Our own findings have no TypeScript error number; printing "TS null" for
+    // them would look like a bug in the reporter.
+    const code = f.code ? `TS${f.code}  ` : "";
+    process.stdout.write(`${rel(f.file)}:${f.line}:${f.column}  ${f.category.toLowerCase()}  ${code}${f.message}\n`);
   }
   const errors = findings.filter((f) => f.category === "Error").length;
   process.stdout.write(`\n${findings.length} problem${findings.length === 1 ? "" : "s"} (${errors} error${errors === 1 ? "" : "s"})\n`);
