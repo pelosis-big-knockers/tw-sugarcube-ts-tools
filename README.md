@@ -68,6 +68,24 @@ word operators (`gt`, `is`, `and`, …). A `<<set $hp to 10>>` types the variabl
 including in `.ts` files that read it. Passages update **live** — you don't have
 to save first; the unsaved buffer is pushed to the language service as you type.
 
+### Property completion after `.`
+
+Typing `$` or `_` lists the story's variables; typing `.` after one lists the
+properties of what it holds — in macro code and in prose alike:
+
+```
+:: Start
+<<set $player to { name: "Ada", hp: 100 }>>
+<<if $player.       <-- hp, name
+The keeper greets $player.name.    <-- charAt, length, toUpperCase, …
+```
+
+Prose needs a little care: `You have $gold.` is a sentence, not a member
+access, so the projection never treats a trailing full stop as code — that
+would report "Identifier expected" on text you wrote correctly. The completion
+list is resolved from the real type instead, so pressing `.` answers without
+putting anything in the file.
+
 ### `<<script>>` is code, not markup
 
 SugarCube hands a `<<script>>` payload straight to `eval`, so none of

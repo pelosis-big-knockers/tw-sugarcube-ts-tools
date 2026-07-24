@@ -302,6 +302,75 @@ function init(modules) {
     return hit;
   }
 
+  // A passage's prose says `You have $player.` and a passage's macro says
+  // `<<print $player.>>`. Both end in a dot, and only one of them is a member
+  // access — so the projector emits the dot ONLY inside a macro, where it is
+  // unambiguously code. Emitting it in prose would turn every sentence that
+  // ends on a variable into an "Identifier expected" parse error on text the
+  // author wrote correctly.
+  //
+  // That leaves the editor with no dot to complete at the instant `.` is
+  // pressed in prose. The cursor is the missing information: the extension
+  // knows the author just typed a dot, so it asks at the END of the projected
+  // expression with `triggerCharacter: "."`, and this fills in the members
+  // TypeScript would have offered had the dot been there. Nothing is guessed —
+  // the type comes from the checker, exactly as it would one keystroke later
+  // (`$player.n` DOES project the dot, and completes natively).
+  //
+  // The outermost expression ending at the position, so `State.variables.player`
+  // wins over the `player` identifier inside it — both end at the same offset,
+  // and the identifier alone would complete against the wrong type.
+  function expressionEndingAt(sourceFile, position) {
+    let found = null;
+    const visit = (node) => {
+      if (found) return;
+      if (node.getFullStart() > position || node.getEnd() < position) return;
+      if (node.getEnd() === position && node !== sourceFile && ts.isExpression(node)) {
+        found = node;
+        return;
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(sourceFile);
+    return found;
+  }
+
+  // Property names that can follow a dot. A symbol whose name isn't a plain
+  // identifier (`"two words"`, a private `#field`, an index signature) is not
+  // reachable by the access the author is typing, so offering it would insert
+  // something that doesn't compile.
+  const IDENTIFIER_NAME = /^[A-Za-z_$][\w$]*$/;
+
+  function memberCompletionsAt(program, sourceFile, position) {
+    const node = expressionEndingAt(sourceFile, position);
+    if (!node) return null;
+    const checker = program.getTypeChecker();
+    let type;
+    try { type = checker.getTypeAtLocation(node); } catch (e) { return null; }
+    if (!type) return null;
+    // The apparent type, so a `string` member offers `length`/`toUpperCase` and
+    // a union offers what all its constituents share, rather than nothing.
+    let props = [];
+    try { props = checker.getPropertiesOfType(checker.getApparentType(type)) || []; } catch (e) { return null; }
+    const entries = [];
+    for (const symbol of props) {
+      const name = symbol.getName();
+      if (!IDENTIFIER_NAME.test(name)) continue;
+      const isMethod = !!(symbol.flags & (ts.SymbolFlags.Method | ts.SymbolFlags.Function));
+      entries.push({
+        name,
+        kind: isMethod ? ts.ScriptElementKind.memberFunctionElement : ts.ScriptElementKind.memberVariableElement,
+        kindModifiers: "",
+        sortText: "0",
+      });
+    }
+    // No properties means we have nothing better than TypeScript's own answer
+    // (the expression is `any`, or isn't an object at all) — say so, rather than
+    // returning an empty list that suppresses whatever else would have shown.
+    if (!entries.length) return null;
+    return { isGlobalCompletion: false, isMemberCompletion: true, isNewIdentifierLocation: false, entries };
+  }
+
   const readStrict = (config) => (!config || typeof config.strict !== "boolean" ? true : config.strict);
   // Opt-in, and meaningless without strict: closing a container is only safe
   // once members are actually declared from their assignments.
@@ -576,6 +645,22 @@ function init(modules) {
       const prior = ls.getCompletionsAtPosition(fileName, position, options, settings);
       const program = ls.getProgram();
       const sf = program && program.getSourceFile(fileName);
+
+      // A dot the projection couldn't carry (see memberCompletionsAt). The tell
+      // is a `.` trigger with no `.` in front of the position: the author typed
+      // one, the projected text doesn't have one there, so TypeScript is
+      // answering for the PREVIOUS dot instead — completing `player` against
+      // `State.variables` when what was asked for is the members of `player`.
+      // That answer is not merely incomplete, it is about the wrong expression,
+      // so it is replaced rather than added to. Confined to passage
+      // projections; in a real .ts file the dot is always where it looks.
+      if (sf && options && options.triggerCharacter === "." &&
+          sf.text.charAt(position - 1) !== "." &&
+          findTweeEntry(norm(fileName))) {
+        const synthesized = memberCompletionsAt(program, sf, position);
+        if (synthesized) return synthesized;
+      }
+
       const iface = sf && containerBeforeDot(sf, position, program.getTypeChecker());
       if (!iface) return prior;
 

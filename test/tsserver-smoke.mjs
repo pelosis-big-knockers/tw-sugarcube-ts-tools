@@ -19,7 +19,7 @@ const require = createRequire(import.meta.url);
 // Positions inside projected passage files are computed from the REAL
 // projection rather than hardcoded, so a layout change in the projector (e.g.
 // scaffolding moving to its own line) doesn't silently invalidate them.
-const { project: projectTwee } = require(path.join(repoRoot, "ts-plugin", "twee.js"));
+const { project: projectTwee, tweeOffsetToTs } = require(path.join(repoRoot, "ts-plugin", "twee.js"));
 const toPosix = (p) => p.split("\\").join("/");
 const TSSERVER = toPosix(path.join(repoRoot, "node_modules", "typescript", "lib", "tsserver.js"));
 
@@ -92,6 +92,12 @@ function withServer(fixtureDir, run) {
       || /Debug Failure/i.test(log);
     resolve({ crashed, log });
   });
+}
+
+// A 1-based line/offset for an absolute offset in `content`.
+function positionAt(content, offset) {
+  const before = content.slice(0, offset);
+  return { line: before.split("\n").length, offset: offset - (before.lastIndexOf("\n") + 1) + 1 };
 }
 
 // Locate a 1-based line/offset for the Nth occurrence of `needle`.
@@ -256,6 +262,77 @@ async function main() {
   check("no language-service crash (passages)", !tweeRun.crashed, "Debug Failure seen in responses or log");
   check("no projected file written to the workspace",
     !existsSync(path.join(tweeFixture, "story.twee.ts")), "projection leaked to disk");
+
+  // ---------- pressing `.` after an object variable ----------
+  // `$player.` must offer that object's properties. Inside a macro the dot is
+  // projected and TypeScript answers on its own; in prose it is NOT (a sentence
+  // ending `You have $gold.` must not become a parse error), so the editor asks
+  // at the end of the projected member with a `.` trigger and the plugin
+  // resolves the members from the checker.
+  //
+  // The negative checks are the load-bearing ones. Asking at the end of
+  // `State.variables.player` is a perfectly valid question with a DIFFERENT
+  // answer — TypeScript completes the identifier `player` against
+  // `State.variables` — so a fix that merely returned "some entries" would look
+  // like it worked while offering the wrong object's members.
+  console.log("\nmember completion after `.`:");
+  const memberFixture = path.join(testDir, "fixture-twee-member");
+  const memberWorld = toPosix(path.join(memberFixture, "world.ts"));
+  const memberTwee = path.join(memberFixture, "story.twee");
+  const memberProjected = toPosix(memberTwee) + ".ts";
+  const memberRun = await withServer(memberFixture, async ({ proj, send, wait, lastOf }) => {
+    send("open", { file: memberWorld, projectRootPath: proj });
+    await wait(2600);
+    // The augmentation settles over successive calls; the passage's types come
+    // from world.ts, which the first generation hasn't applied yet.
+    send("semanticDiagnosticsSync", { file: memberWorld });
+    await wait(1500);
+
+    const source = readFileSync(memberTwee, "utf8");
+    const projection = projectTwee(source);
+    // Exactly what passages.js does: map the offset AFTER the dot, and when
+    // that maps nowhere (prose) fall back to the dot's own offset.
+    const complete = async (afterText, options) => {
+      const dot = source.indexOf(afterText) + afterText.length;
+      const mapped = tweeOffsetToTs(projection.segments, dot + 1);
+      const at = positionAt(projection.ts, mapped === null ? tweeOffsetToTs(projection.segments, dot) : mapped);
+      send("completionInfo", {
+        file: memberProjected, line: at.line, offset: at.offset,
+        includeExternalModuleExports: false, includeInsertTextCompletions: true,
+        ...options,
+      });
+      await wait(1100);
+      return ((lastOf("completionInfo")?.body?.entries) ?? []).map((e) => e.name);
+    };
+
+    const prose = await complete("You have $player", { triggerCharacter: "." });
+    check("a prose `$player.` offers the object's properties",
+      ["name", "hp", "inventory"].every((n) => prose.includes(n)), prose.join(",") || "(none)");
+    check("...and not the container's members, which is the other valid answer",
+      !prose.includes("player"), prose.join(","));
+
+    // A chain must resolve against the LAST member's type. Completing the
+    // outermost expression is what makes this land on `string` rather than
+    // re-offering the object — the two are trivially confused.
+    const chained = await complete("greets $player.name", { triggerCharacter: "." });
+    check("a chained `$player.name.` offers string members",
+      chained.includes("toUpperCase") && chained.includes("length"), chained.slice(0, 8).join(",") || "(none)");
+    check("...not the object's, which is what the enclosing expression would give",
+      !chained.includes("inventory"), chained.slice(0, 8).join(","));
+
+    // The macro path needs no help: the dot is in the projected text.
+    const inMacro = await complete("<<print $player", { triggerCharacter: "." });
+    check("a macro `$player.` completes natively",
+      ["name", "hp", "inventory"].every((n) => inMacro.includes(n)), inMacro.join(",") || "(none)");
+
+    // Without the trigger the question is the ordinary one, and must keep its
+    // ordinary answer — otherwise every completion in a passage gets hijacked.
+    const untriggered = await complete("You have $player", {});
+    check("the same position without a `.` trigger is not hijacked",
+      untriggered.includes("player") && !untriggered.includes("inventory"),
+      untriggered.slice(0, 8).join(",") || "(none)");
+  });
+  check("no language-service crash (member completion)", !memberRun.crashed, "Debug Failure seen");
 
   // ---------- <<if>> narrows the code it guards ----------
   // A closed `<<if>>` projects to a real TypeScript block, so the condition

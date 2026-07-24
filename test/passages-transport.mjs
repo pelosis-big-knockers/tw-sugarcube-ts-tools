@@ -324,6 +324,140 @@ Module._load = originalLoad;
     "wrong offset");
 }
 
+// --- 7. completion for a half-typed member access --------------------------
+// Pressing `.` after an object variable must offer that object's properties.
+// Inside a macro the projection carries the dot and tsserver answers natively;
+// in prose it does not (see twee-projection.mjs), so the provider has to ask at
+// the DOT's own offset and flag the trigger, which is the plugin's cue to
+// resolve the members itself. Getting either half wrong is silent: the provider
+// returns an empty list and the editor just shows nothing.
+{
+  const twee = require(path.join(repoRoot, "ts-plugin", "twee.js"));
+  let provider = null;
+  let triggers = [];
+  const sent = []; // every tsserver request the provider makes
+  // The provider's canned answer. Names differ per case so a check can't pass
+  // by accident on a stale response.
+  let reply = { entries: [{ name: "hp", sortText: "0", kind: "property" }] };
+
+  const uiStub = {
+    ...stub,
+    languages: {
+      ...stub.languages,
+      registerCompletionItemProvider: (selector, p, ...chars) => {
+        provider = p; triggers = chars; return { dispose() {} };
+      },
+      registerDocumentLinkProvider: () => ({ dispose() {} }),
+    },
+    workspace: {
+      ...stub.workspace,
+      textDocuments: [],
+      getConfiguration: () => ({ get: (_k, d) => d }),
+      findFiles: async () => [],
+      onDidChangeConfiguration: () => ({ dispose() {} }),
+    },
+    window: {
+      createOutputChannel: () => ({ appendLine() {} }),
+      activeTextEditor: undefined,
+      setStatusBarMessage() {},
+    },
+    commands: {
+      getCommands: async () => ["typescript.tsserverRequest"],
+      executeCommand: async (command, ...args) => {
+        if (command !== "typescript.tsserverRequest") return undefined;
+        sent.push({ command: args[0], args: args[1] });
+        return { body: reply };
+      },
+      registerCommand: () => ({ dispose() {} }),
+    },
+    extensions: { getExtension: () => ({ isActive: true, activate: async () => {} }) },
+    DocumentLink: class { constructor(range) { this.range = range; } },
+    CompletionItemKind: { Variable: 6 },
+    Selection: class {}, TextEditorRevealType: { InCenterIfOutsideViewport: 2 },
+  };
+  Module._load = function (name, ...rest) {
+    if (name === "vscode") return uiStub;
+    return originalLoad.call(this, name, ...rest);
+  };
+  delete require.cache[require.resolve(path.join(repoRoot, "passages.js"))];
+  const ui = require(path.join(repoRoot, "passages.js"));
+  Module._load = originalLoad;
+  ui.register({ subscriptions: { push() {} } });
+
+  check("the completion provider is registered", !!provider, "never registered");
+  check("`.` is a completion trigger character", triggers.includes("."),
+    `triggers: ${JSON.stringify(triggers)}`);
+
+  // A document just rich enough for the provider: offsets ARE positions here,
+  // which keeps the assertions about mapped offsets readable.
+  const makeDoc = (text) => ({
+    uri: { toString: () => "file:///w/story.twee", fsPath: "C:/w/story.twee" },
+    isDirty: false,
+    getText: () => text,
+    offsetAt: (p) => p.offset,
+    positionAt: (o) => ({ offset: o }),
+  });
+  // Where in the PROJECTION the provider ended up asking, as the text before it.
+  const askedAfter = (text) => {
+    const request = sent[sent.length - 1];
+    if (!request || request.command !== "completionInfo") return null;
+    const { ts } = twee.project(text);
+    const starts = [0];
+    for (let i = 0; i < ts.length; i++) if (ts[i] === "\n") starts.push(i + 1);
+    return ts.slice(0, starts[request.args.line - 1] + request.args.offset - 1);
+  };
+
+  // (a) prose: the dot is not in the projection, so the provider must fall back
+  // to the dot's own offset — landing at the end of `State.variables.player`.
+  const prose = ":: Start\nYou have $player.";
+  reply = { entries: [{ name: "hp", sortText: "0", kind: "property" }] };
+  sent.length = 0;
+  let items = await provider.provideCompletionItems(makeDoc(prose), { offset: prose.length });
+  check("a prose `$player.` still queries tsserver",
+    sent.length === 1 && sent[0].command === "completionInfo",
+    JSON.stringify(sent) || "(nothing sent)");
+  check("...at the end of the projected member, not at the unmapped cursor",
+    askedAfter(prose) !== null && askedAfter(prose).endsWith("State.variables.player"),
+    JSON.stringify(askedAfter(prose)));
+  check("...flagged as a `.` trigger, which is what makes the plugin answer",
+    sent[0] && sent[0].args.triggerCharacter === ".",
+    JSON.stringify(sent[0] && sent[0].args));
+  check("...and the members come back as completion items",
+    !!items && items.length === 1 && items[0].label === "hp",
+    JSON.stringify(items));
+  // Without an explicit range VS Code derives one from the .twee word pattern,
+  // which it does not own — a pattern including the `.` filters everything out.
+  check("...carrying an empty replacement range at the cursor",
+    !!items && !!items[0].range && items[0].range.start.offset === prose.length &&
+      items[0].range.end.offset === prose.length,
+    JSON.stringify(items && items[0].range));
+
+  // (b) macro: the dot IS projected, so the provider asks past it and lets
+  // TypeScript answer natively.
+  const macro = ":: Start\n<<print $player.>>";
+  const macroCursor = macro.lastIndexOf(".") + 1;
+  sent.length = 0;
+  await provider.provideCompletionItems(makeDoc(macro), { offset: macroCursor });
+  check("a macro `$player.` asks past the projected dot",
+    askedAfter(macro) !== null && askedAfter(macro).endsWith("State.variables.player."),
+    JSON.stringify(askedAfter(macro)));
+
+  // (c) a dot that cannot continue an expression is not a member access. Prose
+  // full stops are everywhere, and a query per sentence would be pure noise.
+  sent.length = 0;
+  const plain = ":: Start\nHe left the room.";
+  items = await provider.provideCompletionItems(makeDoc(plain), { offset: plain.length });
+  check("a full stop in ordinary prose queries nothing",
+    sent.length === 0 && !items, `sent ${sent.length}, items ${JSON.stringify(items)}`);
+
+  // (d) the bare-sigil path is untouched: it never reaches tsserver.
+  sent.length = 0;
+  const bare = ":: Start\n<<set $";
+  items = await provider.provideCompletionItems(makeDoc(bare), { offset: bare.length });
+  check("a bare `$` is still served from the workspace sweep, not tsserver",
+    sent.length === 0, JSON.stringify(sent));
+}
+
 const failed = results.filter((r) => !r.ok);
 console.log(`\n${results.length - failed.length}/${results.length} checks passed`);
 if (failed.length) {
