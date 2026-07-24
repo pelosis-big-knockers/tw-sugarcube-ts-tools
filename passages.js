@@ -530,17 +530,44 @@ function register(context) {
           });
         }
       }
-      const at = locate(document, position);
+      // A member access the author has only half-typed — `$player.` with nothing
+      // after the dot yet. Inside a macro the projection carries the dot and
+      // TypeScript answers natively. In PROSE it deliberately does not: a
+      // sentence ending `You have $gold.` is not a member access, and projecting
+      // that dot would put an "Identifier expected" on text the author wrote
+      // correctly. So the offset just after the dot maps to nothing at all, and
+      // the query below would never be sent.
+      //
+      // Ask at the DOT's own offset instead — that maps to the end of the
+      // projected expression — and flag the trigger, which is the plugin's cue
+      // to fill in that expression's members (see memberCompletionsAt).
+      const onDot = text[offset - 1] === ".";
+      let at = locate(document, position);
+      // Only where a dot could actually continue an expression: after an
+      // identifier or a closing bracket, never after prose or whitespace.
+      if (!at && onDot && offset >= 2 && /[\w$\])]/.test(text[offset - 2])) {
+        at = locate(document, document.positionAt(offset - 1));
+      }
       if (!at) return null;
-      const info = await request("completionInfo", {
+      const args = {
         file: at.file, line: at.line, offset: at.offset,
         includeExternalModuleExports: false, includeInsertTextCompletions: true,
-      });
+      };
+      if (onDot) args.triggerCharacter = ".";
+      const info = await request("completionInfo", args);
       const entries = (info && info.entries) || [];
+      // An explicit (empty) replacement range at the cursor. Without one VS Code
+      // derives the range from the document's word pattern — and .twee is owned
+      // by another extension, whose pattern is free to include the `.` we just
+      // completed at. Every entry would then be filtered against `$player.` and
+      // none would match, showing nothing while the provider believed it had
+      // answered. (The same class of failure the definition provider hit.)
+      const range = onDot ? new vscode.Range(position, position) : undefined;
       return entries.map((entry) => {
         const item = new vscode.CompletionItem(entry.name);
         item.sortText = entry.sortText;
         item.detail = entry.kind;
+        if (range) item.range = range;
         return item;
       });
     },

@@ -1,0 +1,5 @@
+:: Start
+<<set $player.hp to 90>>
+The keeper greets $player.name.
+<<print $player.>>
+You have $player.

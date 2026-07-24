@@ -443,6 +443,44 @@ eq("a stray << plus a later apostrophe doesn't kill the rest of the file",
     JSON.stringify(mismatched.slice(0, 3)));
 }
 
+// --- a half-typed member access --------------------------------------------
+// `$player.` with nothing after the dot. In PROSE the projector deliberately
+// drops that dot (`You have $gold.` is a sentence, not a member access), so the
+// offset just after it maps nowhere — which is why completion has to ask at the
+// DOT's own offset instead. Both halves of that are load-bearing for the
+// completion provider, so both are pinned here.
+{
+  const src = ":: Start\nYou have $player.";
+  const { ts, segments } = project(src);
+  const dot = src.lastIndexOf(".");
+  eq("a prose sentence's trailing dot is not projected",
+    ts.includes("State.variables.player."), false);
+  eq("...so the offset after it maps to nothing",
+    tweeOffsetToTs(segments, dot + 1), null);
+  // The dot's own offset sits at the end of the sigil's segment, which maps to
+  // the end of the emitted member — exactly where the members of `player` are.
+  const at = tweeOffsetToTs(segments, dot);
+  eq("...while the dot's own offset maps to the end of the projected member",
+    ts.slice(0, at).endsWith("State.variables.player"), true);
+
+  // A chain behaves the same way, landing past the LAST member so completion
+  // resolves against `name`'s type rather than the object's.
+  const chain = ":: Start\nHi $player.name.";
+  const c = project(chain);
+  const chainDot = chain.lastIndexOf(".");
+  eq("a chained prose dot maps past the last member",
+    c.ts.slice(0, tweeOffsetToTs(c.segments, chainDot)).endsWith("State.variables.player.name"), true);
+
+  // Inside a macro the dot IS code, so it is projected and needs no fallback.
+  const macro = ":: Start\n<<print $player.>>";
+  const m = project(macro);
+  const macroDot = macro.lastIndexOf(".");
+  eq("a macro's trailing dot IS projected",
+    m.ts.includes("State.variables.player."), true);
+  eq("...and the offset after it maps into the projection",
+    m.ts.slice(0, tweeOffsetToTs(m.segments, macroDot + 1)).endsWith("State.variables.player."), true);
+}
+
 // --- recognized file extensions --------------------------------------------
 // tweego's Twee source set: .tw, .twee, and the Twee2 variants .tw2, .twee2.
 check("all four tweego twee extensions are recognized",
