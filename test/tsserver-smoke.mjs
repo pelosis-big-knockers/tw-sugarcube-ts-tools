@@ -19,7 +19,7 @@ const require = createRequire(import.meta.url);
 // Positions inside projected passage files are computed from the REAL
 // projection rather than hardcoded, so a layout change in the projector (e.g.
 // scaffolding moving to its own line) doesn't silently invalidate them.
-const { project: projectTwee, tweeOffsetToTs } = require(path.join(repoRoot, "ts-plugin", "twee.js"));
+const { project: projectTwee, tweeOffsetToTs } = require("tw-sugarcube-analyzer/twee.js");
 const toPosix = (p) => p.split("\\").join("/");
 const TSSERVER = toPosix(path.join(repoRoot, "node_modules", "typescript", "lib", "tsserver.js"));
 

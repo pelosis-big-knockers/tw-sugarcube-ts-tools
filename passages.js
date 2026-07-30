@@ -32,7 +32,7 @@
 //      scanning the workspace for the assignment that created the member.
 // ---------------------------------------------------------------------------
 const vscode = require("vscode");
-const twee = require("./ts-plugin/twee.js");
+const twee = require("tw-sugarcube-analyzer/twee.js");
 
 const TSSERVER_REQUEST = "typescript.tsserverRequest";
 const SELECTOR = { scheme: "file", pattern: twee.TWEE_GLOB };

@@ -137,7 +137,7 @@ Module._load = originalLoad;
 // --- 3. member identification in the projection ----------------------------
 {
   const { memberAtProjection } = passages.__test;
-  const twee = require(path.join(repoRoot, "ts-plugin", "twee.js"));
+  const twee = require("tw-sugarcube-analyzer/twee.js");
 
   const cases = [
     ["<<run setup.attack(3)>>", "attack", "setup"],
@@ -332,7 +332,7 @@ Module._load = originalLoad;
 // resolve the members itself. Getting either half wrong is silent: the provider
 // returns an empty list and the editor just shows nothing.
 {
-  const twee = require(path.join(repoRoot, "ts-plugin", "twee.js"));
+  const twee = require("tw-sugarcube-analyzer/twee.js");
   let provider = null;
   let triggers = [];
   const sent = []; // every tsserver request the provider makes

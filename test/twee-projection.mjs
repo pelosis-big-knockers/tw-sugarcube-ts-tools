@@ -11,7 +11,7 @@ import { fileURLToPath } from "url";
 const testDir = path.dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
 const { project, tsOffsetToTwee, tweeOffsetToTs, tsRangeToTwee } =
-  require(path.join(path.dirname(testDir), "ts-plugin", "twee.js"));
+  require("tw-sugarcube-analyzer/twee.js");
 
 const results = [];
 const check = (name, ok, detail) => {
@@ -485,10 +485,10 @@ eq("a stray << plus a later apostrophe doesn't kill the rest of the file",
 // tweego's Twee source set: .tw, .twee, and the Twee2 variants .tw2, .twee2.
 check("all four tweego twee extensions are recognized",
   ["a.tw", "a.twee", "a.tw2", "a.twee2"].every((f) => project && require(
-    path.join(path.dirname(testDir), "ts-plugin", "twee.js")).isTweeFile(f)));
+    "tw-sugarcube-analyzer/twee.js").isTweeFile(f)));
 check("non-twee extensions are not recognized",
   !["a.ts", "a.js", "a.twx", "a.tw3"].some((f) => require(
-    path.join(path.dirname(testDir), "ts-plugin", "twee.js")).isTweeFile(f)));
+    "tw-sugarcube-analyzer/twee.js").isTweeFile(f)));
 
 const failed = results.filter((r) => !r.ok);
 console.log(`\n${results.length - failed.length}/${results.length} checks passed`);

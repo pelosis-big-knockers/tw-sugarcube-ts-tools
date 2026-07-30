@@ -2,15 +2,29 @@
   "name": "tw-sugarcube-ts-tools",
   "displayName": "Twine SugarCube TypeScript Tools",
   "description": "Editor intelligence for SugarCube in TypeScript/JavaScript: real types on hover, parameter and return-type checking, completion, and go-to-definition for members of setup, State.variables, State.temporary, and settings.",
-  "version": "0.11.1",
+  "version": "0.12.1",
   "publisher": "p-b-k",
   "repository": {
-    "url": "https://github.com/pelosis-big-knockers/tw-sugarcube-ts-tools"
+    "type": "git",
+    "url": "git+https://github.com/pelosis-big-knockers/tw-sugarcube-ts-tools.git"
+  },
+  "homepage": "https://github.com/pelosis-big-knockers/tw-sugarcube-ts-tools#readme",
+  "bugs": {
+    "url": "https://github.com/pelosis-big-knockers/tw-sugarcube-ts-tools/issues"
   },
   "license": "GPL-3.0-or-later",
   "engines": {
-    "vscode": "^1.80.0"
+    "vscode": "^1.80.0",
+    "node": ">=18"
   },
+  "files": [
+    "bin/",
+    "ts-plugin/",
+    "extension.js",
+    "passages.js",
+    "README.md",
+    "LICENSE"
+  ],
   "categories": [
     "Programming Languages"
   ],
@@ -47,17 +61,17 @@
         "twSugarcube.strict": {
           "type": "boolean",
           "default": true,
-          "markdownDescription": "Type the members of `setup`, `State.variables`, `State.temporary`, and `settings` from their assignments, so wrong arguments, wrong types, and typos are reported. Turn this off to keep those containers permissive (`any`) — useful if a story assigns members in ways the plugin can't see."
+          "markdownDescription": "Type the members of `setup`, `State.variables`, `State.temporary`, and `settings` from their assignments, so wrong arguments, wrong types, and typos are reported. Turn this off to keep those containers permissive (`any`) \u2014 useful if a story assigns members in ways the plugin can't see."
         },
         "twSugarcube.passageGoToDefinition": {
           "type": "boolean",
           "default": false,
-          "markdownDescription": "Bind F12 in passage files to this extension's own go-to-definition, bypassing VS Code's definition aggregation. Only needed as a workaround for the same Twee 3 Language Tools hang. It resolves `setup`/variable members by scanning the workspace, and does NOT know about macros or widgets — so with a fixed Twee 3 Language Tools, the built-in F12 is strictly better."
+          "markdownDescription": "Bind F12 in passage files to this extension's own go-to-definition, bypassing VS Code's definition aggregation. Only needed as a workaround for the same Twee 3 Language Tools hang. It resolves `setup`/variable members by scanning the workspace, and does NOT know about macros or widgets \u2014 so with a fixed Twee 3 Language Tools, the built-in F12 is strictly better."
         },
         "twSugarcube.typoDetection": {
           "type": "boolean",
           "default": false,
-          "markdownDescription": "Report members that were never assigned anywhere as errors, so `setup.attck` is caught instead of silently typed `any`. Requires `#twSugarcube.strict#`. Only turn this on if your story creates `setup` and variable members by plain assignment in TypeScript or `<<set>>`: anything created another way — `Object.assign`, a computed `setup[name] =`, or a `.js` file outside the TypeScript project — will be reported as a typo. `settings` is never closed, because SugarCube's Setting API creates those members."
+          "markdownDescription": "Report members that were never assigned anywhere as errors, so `setup.attck` is caught instead of silently typed `any`. Requires `#twSugarcube.strict#`. Only turn this on if your story creates `setup` and variable members by plain assignment in TypeScript or `<<set>>`: anything created another way \u2014 `Object.assign`, a computed `setup[name] =`, or a `.js` file outside the TypeScript project \u2014 will be reported as a typo. `settings` is never closed, because SugarCube's Setting API creates those members."
         }
       }
     },
@@ -76,6 +90,10 @@
       }
     ]
   },
+  "dependencies": {
+    "tw-sugarcube-analyzer": "^0.1.0",
+    "typescript-api": "npm:typescript@^6.0.3"
+  },
   "devDependencies": {
     "@types/twine-sugarcube": "^2.37.2",
     "@vscode/vsce": "^3.2.0",
@@ -83,7 +101,8 @@
   },
   "scripts": {
     "bundle": "node scripts/bundle-plugin.mjs",
-    "postinstall": "node scripts/bundle-plugin.mjs",
+    "//prepare": "NOT postinstall: postinstall also runs when this package is installed as a dependency, where scripts/ isn't even shipped and the staging has nothing to do. `prepare` runs on a local install and before pack/publish, which is exactly when the .vsix layout is needed.",
+    "prepare": "node scripts/bundle-plugin.mjs",
     "test": "npm run bundle && node test/twee-projection.mjs && node test/passages-transport.mjs && node test/tsserver-smoke.mjs && node test/lint-cli.mjs",
     "package": "npm run bundle && npm test && vsce package"
   },

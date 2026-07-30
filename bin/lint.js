@@ -4,23 +4,19 @@
 // Mirrors what the editor extension checks — parameter/return typing on
 // setup/State.variables/State.temporary/settings, and (opt-in) typo detection —
 // but over the WHOLE project at once, for a pre-commit hook or CI. It shares the
-// exact analysis core the plugin uses (ts-plugin/analyzer.js + twee.js), so the
-// two can't drift.
+// exact analysis core the plugin uses (the tw-sugarcube-analyzer package), so
+// the two can't drift.
 //
 // It builds a real Program from the project's tsconfig, injects one virtual .ts
 // per .twee (the same projection the editor sees) plus the generated
 // augmentation, type-checks, and maps passage diagnostics back onto .twee spans.
 "use strict";
 
-const fs = require("fs");
 const path = require("path");
-const { createAnalyzer, norm } = require("../ts-plugin/analyzer.js");
-const twee = require("../ts-plugin/twee.js");
-
-// Upper bound on augmentation regeneration passes (see main). A fixed point is
-// reached in two or three for any real project; this only guarantees the loop
-// terminates if recovery ever oscillates.
-const MAX_GENERATION_PASSES = 8;
+const { norm } = require("tw-sugarcube-analyzer/analyzer.js");
+const twee = require("tw-sugarcube-analyzer/twee.js");
+const { collectProjections, buildAugmentation, MAX_GENERATION_PASSES } =
+  require("tw-sugarcube-analyzer/augmentation.js");
 
 function fail(message) {
   process.stderr.write(`tw-sugarcube-lint: ${message}\n`);
@@ -70,6 +66,14 @@ Exit codes: 0 clean, 1 lint findings, 2 the linter could not run.`;
 // fall back to ours (a 6.x/5.x line), which analyzes the same code the same way
 // — the augmentation and member checks don't depend on 7-specific behaviour, and
 // the editor already checks with VS Code's own 6.x tsserver regardless.
+//
+// "ours" is `typescript-api`, an ALIAS for typescript@^6 (see package.json), and
+// it is a real dependency rather than a dev one. That matters: this used to fall
+// back to a plain `require("typescript")`, which resolved only because the repo
+// had TypeScript as a devDependency — so the CLI worked from a checkout and died
+// the moment anyone installed it from npm, on the very projects it most needs to
+// serve (a story on the native 7.x line). The alias also keeps our copy from
+// colliding with whatever `typescript` the project itself pins.
 function hasProgramApi(ts) {
   return !!(ts && typeof ts.createProgram === "function" && ts.TypeFormatFlags && ts.DiagnosticCategory);
 }
@@ -83,9 +87,11 @@ function loadTypeScript(dir) {
     if (hasProgramApi(ts)) return { ts, source: `project (${ts.version})` };
   } catch (e) { /* fall through */ }
 
-  try {
-    const ts = require("typescript");
-    if (hasProgramApi(ts)) {
+  // `typescript` last, so a checkout without the alias installed still works.
+  for (const name of ["typescript-api", "typescript"]) {
+    try {
+      const ts = require(name);
+      if (!hasProgramApi(ts)) continue;
       if (projectVersion) {
         process.stderr.write(
           `tw-sugarcube-lint: the project's TypeScript ${projectVersion} has no in-process ` +
@@ -93,8 +99,8 @@ function loadTypeScript(dir) {
         );
       }
       return { ts, source: `bundled (${ts.version})` };
-    }
-  } catch (e) { /* fall through */ }
+    } catch (e) { /* try the next one */ }
+  }
 
   fail("could not find a TypeScript with the JavaScript compiler API (need a 6.x/5.x line)");
 }
@@ -105,54 +111,11 @@ function findTsconfig(ts, dir) {
   return found;
 }
 
-// Every .twee under the project root, projected to TypeScript.
-function collectProjections(root) {
-  const projections = new Map(); // normalized virtual path -> { content, segments, source, virtual, text }
-  const walk = (d, depth) => {
-    if (depth > twee.MAX_SCAN_DEPTH) return;
-    let entries = [];
-    try { entries = fs.readdirSync(d, { withFileTypes: true }); } catch (e) { return; }
-    for (const entry of entries) {
-      const full = path.join(d, entry.name);
-      if (entry.isDirectory()) {
-        if (entry.name === "node_modules" || entry.name[0] === ".") continue;
-        walk(full, depth + 1);
-      } else if (twee.isTweeFile(entry.name)) {
-        let text = "";
-        try { text = fs.readFileSync(full, "utf8"); } catch (e) { continue; }
-        let projected = { ts: "", segments: [] };
-        try { projected = twee.project(text); } catch (e) { /* keep empty */ }
-        const source = full.replace(/\\/g, "/");
-        const virtual = source + ".ts";
-        // The analyzer's lookup contract keys projections by norm() (which
-        // case-folds), so two twee files differing only in case would silently
-        // collapse to one entry and the other would never be linted — rare, but
-        // say so instead of reporting a clean run.
-        const prior = projections.get(norm(virtual));
-        if (prior && prior.source !== source) {
-          process.stderr.write(
-            `tw-sugarcube-lint: warning: ${source} and ${prior.source} differ only by case; ` +
-            `only one will be linted\n`
-          );
-        }
-        // Keep the source text: the reporter maps diagnostics back onto it, and
-        // re-reading the file per diagnostic was pure waste.
-        projections.set(norm(virtual), {
-          content: projected.ts, segments: projected.segments, source, virtual, text,
-        });
-      }
-    }
-  };
-  walk(root, 0);
-  return projections;
-}
-
 function main() {
   const opts = parseArgs(process.argv.slice(2));
   if (opts.help) { process.stdout.write(HELP + "\n"); return; }
 
   const { ts } = loadTypeScript(opts.dir);
-  const analyzer = createAnalyzer(ts);
   const configPath = findTsconfig(ts, opts.dir);
   const projectRoot = path.dirname(configPath);
 
@@ -170,67 +133,25 @@ function main() {
     fail(configErrors.map((e) => ts.flattenDiagnosticMessageText(e.messageText, "\n")).join("\n"));
   }
 
-  const projections = collectProjections(projectRoot);
+  const projections = collectProjections(projectRoot, (message) =>
+    process.stderr.write(`tw-sugarcube-lint: warning: ${message}\n`)
+  );
 
-  // Two synthetic files live only in memory: the augmentation and each passage
-  // projection. The augmentation path sits inside the project so its relative
+  // The augmentation path sits inside the project so its relative
   // `import "twine-sugarcube"` resolves against the project's node_modules.
   const augPath = path.join(projectRoot, "__sugarcube-generated__.d.ts").replace(/\\/g, "/");
-  const synthetic = new Map(); // normalized path -> content
-  for (const proj of projections.values()) synthetic.set(norm(proj.virtual), proj.content);
-  synthetic.set(norm(augPath), ""); // filled after the first pass
 
-  const rootNames = parsed.fileNames.concat([...projections.values()].map((p) => p.virtual), augPath);
-
-  const host = ts.createCompilerHost(parsed.options, true);
-  const origReadFile = host.readFile.bind(host);
-  const origFileExists = host.fileExists.bind(host);
-  const origGetSource = host.getSourceFile.bind(host);
-  host.readFile = (f) => (synthetic.has(norm(f)) ? synthetic.get(norm(f)) : origReadFile(f));
-  host.fileExists = (f) => (synthetic.has(norm(f)) ? true : origFileExists(f));
-  // Two programs are built back to back (type recovery, then the real check),
-  // and the default host re-reads and re-parses every file per program. Nothing
-  // on disk changes between the passes, so cache the parsed SourceFiles; only
-  // the augmentation's content differs, and its cache entry is keyed on content
-  // so the second pass re-parses exactly that one file.
-  // Keyed by the EXACT file name, not norm(): norm lowercases, and on a
-  // case-sensitive filesystem two real files differing only in case would
-  // collapse into one cache entry — the second would be served the first's
-  // SourceFile under the wrong name and never actually parsed.
-  const sourceCache = new Map(); // exact path -> { content, sf }
-  host.getSourceFile = (fileName, langVersion, onError, shouldCreate) => {
-    const content = synthetic.has(norm(fileName)) ? synthetic.get(norm(fileName)) : null;
-    const hit = sourceCache.get(fileName);
-    if (hit && hit.content === content) return hit.sf;
-    const sf = content !== null
-      ? ts.createSourceFile(fileName, content, langVersion, true)
-      : origGetSource(fileName, langVersion, onError, shouldCreate);
-    if (sf) sourceCache.set(fileName, { content, sf });
-    return sf;
-  };
-
-  // Generate the augmentation, then type-check against it. One pass is not
-  // enough: a recovered member type can DEPEND on a previously recovered one.
-  // `<<set $hero to setup.makeHero()>>` can only be typed once `setup.makeHero`
-  // itself has been declared, so against the empty-augmentation program it comes
-  // back `any` — and every error downstream of it silently disappears. The
-  // editor plugin regenerates on each program update until the content stops
-  // changing (ts-plugin/index.js `refresh`); iterate to that same fixed point
-  // here, or the linter reports clean on code the extension squiggles.
-  let program = ts.createProgram(rootNames, parsed.options, host);
-  let converged = false;
-  // Only the settled pass's downgrades are real: an early pass sees members that
-  // later passes go on to type, so reporting from one would warn about types
-  // that recovery was still in the middle of resolving.
-  let downgrades = [];
-  for (let pass = 0; pass < MAX_GENERATION_PASSES; pass++) {
-    const pending = [];
-    const next = analyzer.generate(program, augPath, opts.strict, opts.typoDetection && opts.strict, projections, pending);
-    downgrades = pending;
-    if (next === synthetic.get(norm(augPath))) { converged = true; break; }
-    synthetic.set(norm(augPath), next);
-    program = ts.createProgram(rootNames, parsed.options, host);
-  }
+  // Generate the augmentation, then type-check against it. The pass loop lives
+  // in tw-sugarcube-analyzer because the plugin, this CLI and tw-server's build
+  // all need it and re-implementing it per consumer is how they drift.
+  const { program, downgrades, converged } = buildAugmentation(ts, {
+    rootNames: parsed.fileNames,
+    options: parsed.options,
+    augPath,
+    projections,
+    strict: opts.strict,
+    typoDetection: opts.typoDetection,
+  });
   // Recovery normally settles in two or three passes. If it hasn't, the findings
   // below are from a snapshot mid-flight rather than a settled one — say so
   // rather than presenting them as the whole truth.

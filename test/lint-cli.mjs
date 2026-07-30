@@ -4,13 +4,13 @@
 // driving tsserver, so this verifies that path independently: passage errors map
 // back onto .twee spans, exit codes are CI-appropriate, and typo detection has
 // the same opt-in / false-positive-safe behaviour as the editor. It shares the
-// analysis core with the plugin (ts-plugin/analyzer.js), so the tsserver smoke
+// analysis core with the plugin (tw-sugarcube-analyzer), so the tsserver smoke
 // suite covers the same rules from the other side.
 import { spawnSync } from "child_process";
 import { mkdirSync, writeFileSync } from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
-import { MAX_TYPE_LENGTH } from "../ts-plugin/analyzer.js";
+import { MAX_TYPE_LENGTH } from "tw-sugarcube-analyzer/analyzer.js";
 
 const testDir = path.dirname(fileURLToPath(import.meta.url));
 

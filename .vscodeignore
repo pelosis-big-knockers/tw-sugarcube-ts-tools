@@ -6,5 +6,13 @@ test/**
 docs/**
 *.vsix
 node_modules/**
+# The language-service plugin, staged here by scripts/bundle-plugin.mjs so VS
+# Code can resolve it by package name.
 !node_modules/tw-sugarcube-ts-plugin/**
+# ...and the analysis core it requires. Both of these are load-bearing: the
+# plugin's `require("tw-sugarcube-analyzer/analyzer.js")` throws inside tsserver
+# if the package isn't in the .vsix, and a throw there takes down the whole
+# language service rather than degrading. Verify with `npx vsce ls` after
+# changing anything here.
+!node_modules/tw-sugarcube-analyzer/**
 .claude

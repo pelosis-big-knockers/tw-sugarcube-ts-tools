@@ -69,11 +69,12 @@ function init(modules) {
   // participate.
   const fsMod = require("fs");
   const pathMod = require("path");
-  const twee = require("./twee.js");
-  // Shared with bin/lint.js so the CLI and the editor cannot drift apart.
-  // It takes `ts` as a parameter because the plugin must use the TypeScript
-  // instance tsserver injected, not one it resolves itself.
-  const { createAnalyzer } = require("./analyzer.js");
+  const twee = require("tw-sugarcube-analyzer/twee.js");
+  // Shared with bin/lint.js and tw-server's build, so the editor, the CLI and
+  // the build cannot drift apart. It takes `ts` as a parameter because the
+  // plugin must use the TypeScript instance tsserver injected, not one it
+  // resolves itself.
+  const { createAnalyzer } = require("tw-sugarcube-analyzer/analyzer.js");
   const analyzer = createAnalyzer(ts);
 
   // Per-project passage state, keyed by the project's current directory. These
