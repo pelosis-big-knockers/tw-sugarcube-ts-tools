@@ -1,0 +1,24 @@
+# What NOT to publish to npm.
+#
+# This exists instead of a package.json "files" allowlist because vsce refuses
+# to run when a .vscodeignore and "files" are both present ("VSCE does not
+# support combining both strategies"), and .vscodeignore has to stay — it is
+# what re-includes node_modules/tw-sugarcube-analyzer into the .vsix.
+#
+# So the two packagers are kept apart: vsce reads .vscodeignore, npm reads this.
+# npm prefers .npmignore over .gitignore, so everything the .gitignore covered
+# has to be repeated here.
+#
+# What ships: bin/, ts-plugin/, extension.js, passages.js, README.md, LICENSE,
+# package.json. Check with `npm pack --dry-run` after changing anything.
+.claude/
+.git/
+.gitignore
+.npmignore
+.vscodeignore
+scripts/
+test/
+docs/
+*.vsix
+*.tgz
+*.log
